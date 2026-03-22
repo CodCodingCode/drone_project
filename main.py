@@ -2,44 +2,17 @@
 """
 Drone simulation entry point for Isaac Sim + Pegasus Simulator.
 
-Usage (from host or inside isaac-drone container):
-    python main.py --mode hover    # headless physics test
-    python main.py --mode scene    # livestream scene (view at /viewer)
-    python main.py --mode video    # record frames to /tmp/drone_frames/
+Requires: conda activate isaac
 
-If run from the Lambda host (outside the container), this script will
-automatically re-launch itself inside the isaac-drone container.
+Usage:
+    python main.py --mode hover    # headless physics test
+    python main.py --mode scene    # livestream scene (view at <server-url>/viewer)
+    python main.py --mode video    # record frames to /tmp/drone_frames/
 """
 
-import sys
 import os
 import argparse
-import subprocess
 
-
-ISAAC_PYTHON = "/isaac-sim/python.sh"
-CONTAINER_NAME = "isaac-drone"
-
-
-def is_inside_container():
-    return os.path.exists(ISAAC_PYTHON)
-
-
-def relaunch_in_container(mode):
-    """Re-execute this script inside the isaac-drone Docker container."""
-    script_path = os.path.abspath(__file__)
-    # Mount script into container and run it
-    cmd = [
-        "docker", "exec", CONTAINER_NAME,
-        ISAAC_PYTHON, script_path, "--mode", mode, "--no-relaunch"
-    ]
-    print(f"[main.py] Not inside container. Re-launching in '{CONTAINER_NAME}'...")
-    print(f"[main.py] Running: {' '.join(cmd)}")
-    result = subprocess.run(cmd)
-    sys.exit(result.returncode)
-
-
-# ── Modes ──────────────────────────────────────────────────────────────────
 
 def run_hover():
     """Headless physics test: spawn drone, run 500 steps, print positions."""
@@ -75,7 +48,7 @@ def run_hover():
 def run_scene():
     """
     Launch Isaac Sim with livestream enabled.
-    View the scene by opening /viewer in your browser (same URL as VSCode, just /viewer).
+    View the scene by opening <server-url>/viewer in your browser.
     """
     from isaacsim import SimulationApp
     app = SimulationApp({
@@ -128,7 +101,6 @@ def run_scene():
 
 def run_video():
     """Record 300 frames to /tmp/drone_frames/ using Replicator."""
-    import numpy as np
     from isaacsim import SimulationApp
     app = SimulationApp({"headless": True, "renderer": "RayTracedLighting", "width": 1280, "height": 720})
 
@@ -139,7 +111,6 @@ def run_video():
     from pegasus.simulator.logic.vehicles.multirotor import Multirotor, MultirotorConfig
     from pegasus.simulator.logic.interface.pegasus_interface import PegasusInterface
     from pegasus.simulator.params import ROBOTS
-    from pxr import Gf
 
     pg = PegasusInterface()
     pg.initialize_world()
@@ -178,18 +149,11 @@ def run_video():
     app.close()
 
 
-# ── Entry point ─────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Drone sim launcher")
     parser.add_argument("--mode", choices=["hover", "scene", "video"], default="hover",
                         help="hover=headless test | scene=livestream | video=record frames")
-    parser.add_argument("--no-relaunch", action="store_true",
-                        help="Skip container re-launch check (used internally)")
     args = parser.parse_args()
-
-    if not args.no_relaunch and not is_inside_container():
-        relaunch_in_container(args.mode)
 
     modes = {"hover": run_hover, "scene": run_scene, "video": run_video}
     modes[args.mode]()
