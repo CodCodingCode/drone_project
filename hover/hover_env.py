@@ -89,8 +89,9 @@ class HoverEnvCfg(DirectRLEnvCfg):
     moment_scale = 0.01
 
     # Reward scales
-    pos_reward_scale = 10.0        # shaped distance-to-hover-target
-    uprightness_reward_scale = 2.0 # bonus for staying level
+    xy_reward_scale = 12.0         # shaped XY distance-to-hover-target
+    z_reward_scale = 8.0           # shaped Z distance-to-hover-target
+    uprightness_reward_scale = 0.5 # reduced from 2.0 to allow tilting for XY correction
     lin_vel_penalty_scale = -0.05  # penalise erratic movement
     ang_vel_penalty_scale = -0.01  # penalise spinning
     alive_reward = 0.5             # per-step bonus for not crashing
@@ -127,12 +128,12 @@ class HoverEnv(DirectRLEnv):
         # Logging accumulators — rewards
         self._episode_sums = {
             k: torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
-            for k in ["pos", "uprightness", "lin_vel", "ang_vel", "alive", "success"]
+            for k in ["xy_pos", "z_pos", "uprightness", "lin_vel", "ang_vel", "alive", "success"]
         }
         # Logging accumulators — raw metrics (not reward-scaled)
         self._episode_metrics = {
             k: torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
-            for k in ["dist_to_target", "uprightness_raw", "ang_vel_mag"]
+            for k in ["dist_to_target", "xy_dist", "z_dist", "uprightness_raw", "ang_vel_mag"]
         }
         self._episode_step_counts = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
 
@@ -224,19 +225,24 @@ class HoverEnv(DirectRLEnv):
     def _get_rewards(self) -> torch.Tensor:
         drone_pos = self._robot.data.root_pos_w
 
-        # -- Position tracking reward (tanh-shaped, same style as lang_nav) --
+        # -- Separate XY and Z position rewards --
+        xy_dist = torch.linalg.norm(self._target_pos_w[:, :2] - drone_pos[:, :2], dim=1)
+        z_dist = torch.abs(self._target_pos_w[:, 2] - drone_pos[:, 2])
+        xy_mapped = 1.0 - torch.tanh(xy_dist / 0.8)
+        z_mapped = 1.0 - torch.tanh(z_dist / 0.8)
+
+        # Full 3D distance for success check
         dist = torch.linalg.norm(self._target_pos_w - drone_pos, dim=1)
-        dist_mapped = 1.0 - torch.tanh(dist / 0.8)
 
         # -- Uprightness reward: projected_gravity_b z-component should be -1 when level --
-        # gravity_b is (0,0,-1) when perfectly upright → z component = -1
         uprightness = -self._robot.data.projected_gravity_b[:, 2]  # +1 when upright, -1 when inverted
 
         # -- Terminal success bonus (one-time, not scaled by step_dt) --
         success = (dist < self.cfg.success_threshold).float()
 
         rewards = {
-            "pos": dist_mapped * self.cfg.pos_reward_scale * self.step_dt,
+            "xy_pos": xy_mapped * self.cfg.xy_reward_scale * self.step_dt,
+            "z_pos": z_mapped * self.cfg.z_reward_scale * self.step_dt,
             "uprightness": uprightness * self.cfg.uprightness_reward_scale * self.step_dt,
             "lin_vel": (
                 torch.sum(torch.square(self._robot.data.root_lin_vel_b), dim=1)
@@ -259,6 +265,8 @@ class HoverEnv(DirectRLEnv):
         # Track raw physical metrics (not reward-scaled)
         ang_vel_mag = torch.linalg.norm(self._robot.data.root_ang_vel_b, dim=1)
         self._episode_metrics["dist_to_target"] += dist
+        self._episode_metrics["xy_dist"] += xy_dist
+        self._episode_metrics["z_dist"] += z_dist
         self._episode_metrics["uprightness_raw"] += uprightness
         self._episode_metrics["ang_vel_mag"] += ang_vel_mag
         self._episode_step_counts += 1
