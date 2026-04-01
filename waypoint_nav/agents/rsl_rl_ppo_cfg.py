@@ -8,6 +8,8 @@ class WaypointNavPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     max_iterations = 2000
     save_interval = 50
     experiment_name = "waypoint_nav"
+    logger = "wandb"
+    wandb_project = "drone-waypoint-nav"
 
     # 256-wide layers match lang_nav so weights transfer directly
     actor = RslRlMLPModelCfg(

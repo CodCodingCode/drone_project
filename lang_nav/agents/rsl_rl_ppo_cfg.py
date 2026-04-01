@@ -8,6 +8,8 @@ class LangDronePPORunnerCfg(RslRlOnPolicyRunnerCfg):
     max_iterations = 3000
     save_interval = 50
     experiment_name = "lang_drone_direct"
+    logger = "wandb"
+    wandb_project = "drone-lang-nav"
 
     actor = RslRlMLPModelCfg(
         hidden_dims=[256, 256],

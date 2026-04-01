@@ -29,6 +29,7 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.utils.math import subtract_frame_transforms
 
 from isaaclab_assets import CRAZYFLIE_CFG  # isort: skip
@@ -140,7 +141,10 @@ class WaypointNavEnv(DirectRLEnv):
         if self.device == "cpu":
             self.scene.filter_collisions(global_prim_paths=[self.cfg.terrain.prim_path])
 
-        light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
+        light_cfg = sim_utils.DomeLightCfg(
+            intensity=750.0,
+            texture_file=f"{ISAAC_NUCLEUS_DIR}/Materials/Textures/Skies/PolyHaven/kloofendal_43d_clear_puresky_4k.hdr",
+        )
         light_cfg.func("/World/Light", light_cfg)
 
     # ------------------------------------------------------------------

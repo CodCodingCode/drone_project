@@ -27,6 +27,7 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.utils.math import subtract_frame_transforms
 
 from isaaclab_assets import CRAZYFLIE_CFG  # isort: skip
@@ -75,6 +76,7 @@ class HoverEnvCfg(DirectRLEnvCfg):
             dynamic_friction=1.0,
             restitution=0.0,
         ),
+        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.15, 0.18, 0.15)),
         debug_vis=False,
     )
 
@@ -92,11 +94,14 @@ class HoverEnvCfg(DirectRLEnvCfg):
     lin_vel_penalty_scale = -0.05  # penalise erratic movement
     ang_vel_penalty_scale = -0.01  # penalise spinning
     alive_reward = 0.5             # per-step bonus for not crashing
+    success_reward = 5.0           # one-time terminal bonus (matches waypoint_nav)
+    success_threshold = 0.8        # metres to count as "reached target"
 
     # Hover target randomisation
-    hover_height_min = 0.5
-    hover_height_max = 1.5
-    hover_xy_range = 1.0  # target spawns within ±this from env origin
+    hover_height_min = 0.3
+    hover_height_max = 2.0
+    hover_xy_range = 0.5  # target spawns within ±this from env origin
+    hover_xy_boundary = 3.0  # terminate if drone drifts beyond ±this from env origin
 
 
 class HoverEnv(DirectRLEnv):
@@ -119,11 +124,17 @@ class HoverEnv(DirectRLEnv):
         self._gravity_magnitude = torch.tensor(self.sim.cfg.gravity, device=self.device).norm()
         self._robot_weight = (self._robot_mass * self._gravity_magnitude).item()
 
-        # Logging accumulators
+        # Logging accumulators — rewards
         self._episode_sums = {
             k: torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
-            for k in ["pos", "uprightness", "lin_vel", "ang_vel", "alive"]
+            for k in ["pos", "uprightness", "lin_vel", "ang_vel", "alive", "success"]
         }
+        # Logging accumulators — raw metrics (not reward-scaled)
+        self._episode_metrics = {
+            k: torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+            for k in ["dist_to_target", "uprightness_raw", "ang_vel_mag"]
+        }
+        self._episode_step_counts = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
 
         # Initial reset
         self._reset_idx(None)
@@ -140,12 +151,32 @@ class HoverEnv(DirectRLEnv):
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
         self._terrain = self.cfg.terrain.class_type(self.cfg.terrain)
 
+        # Coloured corner markers so you can see the drone moving relative to something
+        for pos, color, name in [
+            ((2.0, 0.0, 0.15), (0.8, 0.1, 0.1), "marker_red"),
+            ((-2.0, 0.0, 0.15), (0.1, 0.1, 0.8), "marker_blue"),
+            ((0.0, 2.0, 0.15), (0.1, 0.8, 0.1), "marker_green"),
+            ((0.0, -2.0, 0.15), (0.8, 0.8, 0.1), "marker_yellow"),
+        ]:
+            m_cfg = sim_utils.CylinderCfg(
+                radius=0.08,
+                height=0.3,
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=color),
+            )
+            m_cfg.func(f"/World/envs/env_.*/{name}", m_cfg, translation=pos)
+
         self.scene.clone_environments(copy_from_source=False)
         if self.device == "cpu":
             self.scene.filter_collisions(global_prim_paths=[self.cfg.terrain.prim_path])
 
-        light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
+        # Lighting — key light + fill for depth
+        light_cfg = sim_utils.DomeLightCfg(
+            intensity=1500.0,
+            texture_file=f"{ISAAC_NUCLEUS_DIR}/Materials/Textures/Skies/PolyHaven/kloofendal_43d_clear_puresky_4k.hdr",
+        )
         light_cfg.func("/World/Light", light_cfg)
+        dist_light = sim_utils.DistantLightCfg(intensity=800.0, color=(1.0, 0.95, 0.85))
+        dist_light.func("/World/SunLight", dist_light)
 
     # ------------------------------------------------------------------
     # Physics step — identical action mapping to lang_nav
@@ -201,6 +232,9 @@ class HoverEnv(DirectRLEnv):
         # gravity_b is (0,0,-1) when perfectly upright → z component = -1
         uprightness = -self._robot.data.projected_gravity_b[:, 2]  # +1 when upright, -1 when inverted
 
+        # -- Terminal success bonus (one-time, not scaled by step_dt) --
+        success = (dist < self.cfg.success_threshold).float()
+
         rewards = {
             "pos": dist_mapped * self.cfg.pos_reward_scale * self.step_dt,
             "uprightness": uprightness * self.cfg.uprightness_reward_scale * self.step_dt,
@@ -215,11 +249,20 @@ class HoverEnv(DirectRLEnv):
                 * self.step_dt
             ),
             "alive": torch.ones(self.num_envs, device=self.device) * self.cfg.alive_reward * self.step_dt,
+            "success": success * self.cfg.success_reward,
         }
 
         reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
         for k, v in rewards.items():
             self._episode_sums[k] += v
+
+        # Track raw physical metrics (not reward-scaled)
+        ang_vel_mag = torch.linalg.norm(self._robot.data.root_ang_vel_b, dim=1)
+        self._episode_metrics["dist_to_target"] += dist
+        self._episode_metrics["uprightness_raw"] += uprightness
+        self._episode_metrics["ang_vel_mag"] += ang_vel_mag
+        self._episode_step_counts += 1
+
         return reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -231,7 +274,15 @@ class HoverEnv(DirectRLEnv):
         # Flipped upside down (projected gravity z > 0 means inverted)
         flipped = self._robot.data.projected_gravity_b[:, 2] > 0.5
 
-        terminated = fell | flipped
+        # Drifted too far horizontally from env origin
+        xy_offset = drone_pos[:, :2] - self._terrain.env_origins[:, :2]
+        out_of_bounds_xy = torch.any(torch.abs(xy_offset) > self.cfg.hover_xy_boundary, dim=1)
+
+        # Reached the hover target
+        dist = torch.linalg.norm(self._target_pos_w - drone_pos, dim=1)
+        success = dist < self.cfg.success_threshold
+
+        terminated = fell | flipped | out_of_bounds_xy | success
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         return terminated, time_out
 
@@ -239,12 +290,20 @@ class HoverEnv(DirectRLEnv):
         if env_ids is None or len(env_ids) == self.num_envs:
             env_ids = self._robot._ALL_INDICES
 
-        # Logging
+        # Logging — reward components
         extras: dict = {}
         for key in self._episode_sums:
             avg = torch.mean(self._episode_sums[key][env_ids])
             extras[f"Episode_Reward/{key}"] = avg / self.max_episode_length_s
             self._episode_sums[key][env_ids] = 0.0
+
+        # Logging — raw stability metrics (per-step averages over the episode)
+        steps = self._episode_step_counts[env_ids].clamp(min=1)
+        for key in self._episode_metrics:
+            extras[f"Metrics/{key}"] = torch.mean(self._episode_metrics[key][env_ids] / steps)
+            self._episode_metrics[key][env_ids] = 0.0
+        self._episode_step_counts[env_ids] = 0
+
         self.extras["log"] = extras
 
         self._robot.reset(env_ids)
@@ -278,4 +337,4 @@ class HoverEnv(DirectRLEnv):
         )
         self._target_pos_w[env_ids, 0] = self._terrain.env_origins[env_ids, 0] + target_x
         self._target_pos_w[env_ids, 1] = self._terrain.env_origins[env_ids, 1] + target_y
-        self._target_pos_w[env_ids, 2] = target_z
+        self._target_pos_w[env_ids, 2] = self._terrain.env_origins[env_ids, 2] + target_z
