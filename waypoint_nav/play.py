@@ -57,6 +57,10 @@ def main():
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.sim.device = args_cli.device if args_cli.device else "cuda:0"
 
+    # Close-up camera tracking the drone (matches hover play.py)
+    env_cfg.viewer.eye = (1.0, 1.0, 0.8)
+    env_cfg.viewer.lookat = (0.0, 0.0, 0.0)
+
     # Enable rendering every step for video capture
     if args_cli.video:
         env_cfg.sim.render_interval = 1

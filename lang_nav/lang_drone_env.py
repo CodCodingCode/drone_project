@@ -1,19 +1,18 @@
-"""Language-grounded drone navigation environment.
+"""Language-and-vision-grounded drone navigation environment (VLA).
 
-The drone receives a natural language command ("go to the square") and must
-navigate to the matching geometric object in the scene. Three colored objects
-are placed at fixed positions in each env:
+The drone receives a natural language command ("go to the square") and an
+onboard camera image, and must navigate to the matching geometric object
+in the scene. Three colored objects are placed at fixed positions:
   - Cube   (red)   at offset (-1.5,  0.0, 0.2) → index 0
   - Sphere (blue)  at offset ( 1.5,  0.0, 0.2) → index 1
   - Cylinder (green) at offset (0.0, 1.5, 0.2) → index 2
 
-Observation (533-dim):
-  [0:3]   root_lin_vel_b
-  [3:6]   root_ang_vel_b
-  [6:9]   projected_gravity_b
-  [9:12]  target object position in body frame
-  [12:524] CLIP text embedding of the command (512-dim, frozen)
-  [524:533] all 3 object positions relative to drone, flattened (9-dim)
+Observation (1033-dim):
+  [0:3]     root_lin_vel_b
+  [3:6]     root_ang_vel_b
+  [6:9]     projected_gravity_b
+  [9:521]   CLIP text embedding of the command (512-dim, frozen)
+  [521:1033] CLIP image embedding from onboard camera (512-dim, frozen)
 
 Reward:
   + shaped distance-to-target
@@ -33,11 +32,12 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, ArticulationCfg
 from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sensors import TiledCamera, TiledCameraCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
-from isaaclab.utils.math import subtract_frame_transforms
+from isaaclab.utils.math import quat_apply, subtract_frame_transforms
 
 from isaaclab_assets import CRAZYFLIE_CFG  # isort: skip
 
@@ -57,8 +57,8 @@ class LangDroneEnvCfg(DirectRLEnvCfg):
     episode_length_s = 15.0
     decimation = 2
     action_space = 4
-    # 12 drone state + 512 CLIP embedding + 9 object relative positions
-    observation_space = 12 + _CLIP_DIM + 9
+    # 9 drone state + 512 CLIP text + 512 CLIP image
+    observation_space = 9 + _CLIP_DIM + _CLIP_DIM
     state_space = 0
     debug_vis = False
 
@@ -91,12 +91,33 @@ class LangDroneEnvCfg(DirectRLEnvCfg):
 
     # Larger env spacing so objects don't overlap between envs
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=1024, env_spacing=6.0, replicate_physics=True, clone_in_fabric=True
+        num_envs=1024, env_spacing=6.0, replicate_physics=True
     )
 
     robot: ArticulationCfg = CRAZYFLIE_CFG.replace(prim_path="/World/envs/env_.*/Robot")
     thrust_to_weight = 1.9
     moment_scale = 0.01
+
+    # Onboard camera (64x64, resized to 224x224 for CLIP)
+    # Spawned at env level; pose updated each step to follow drone body
+    tiled_camera: TiledCameraCfg = TiledCameraCfg(
+        prim_path="/World/envs/env_.*/Camera",
+        offset=TiledCameraCfg.OffsetCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0), convention="world"),
+        data_types=["rgb"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=16.0,
+            focus_distance=100.0,
+            horizontal_aperture=15.0,
+            clipping_range=(0.01, 20.0),
+        ),
+        width=64,
+        height=64,
+    )
+    # Camera offset from drone body centre (forward + slightly up)
+    camera_body_offset_pos = (0.05, 0.0, 0.01)
+
+    # How often to run CLIP image encoding (every N physics steps)
+    clip_encode_every_n = 5
 
     # Reward scales
     lin_vel_reward_scale = -0.05
@@ -124,7 +145,15 @@ class LangDroneEnv(DirectRLEnv):
         self._target_obj_idx = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self._clip_emb = torch.zeros(self.num_envs, _CLIP_DIM, device=self.device)
 
+        # Per-env vision state (cached CLIP image embedding)
+        self._clip_img_emb = torch.zeros(self.num_envs, _CLIP_DIM, device=self.device)
+        self._steps_since_encode = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+
+        # Camera body-frame offset (constant, used to position camera relative to drone)
+        self._cam_offset = torch.tensor(self.cfg.camera_body_offset_pos, dtype=torch.float32, device=self.device)
+
         # World positions of all 3 objects for every env: (num_envs, 3, 3)
+        # Kept for reward/done computation (ground truth, not in obs)
         offsets = torch.tensor(_OBJ_OFFSETS, dtype=torch.float32, device=self.device)
         self._obj_pos_w = self._terrain.env_origins.unsqueeze(1) + offsets.unsqueeze(0)
 
@@ -140,10 +169,10 @@ class LangDroneEnv(DirectRLEnv):
             for k in ["lin_vel", "ang_vel", "distance_to_goal", "success", "wrong_object"]
         }
 
-        # CLIP grounder — loaded once, frozen
+        # CLIP grounder — loaded once, frozen (text + vision)
         self._grounder = CLIPGrounder(device=self.device)
 
-        # Warm up with a full-env reset so CLIP embeddings are populated
+        # Warm up with a full-env reset so CLIP text embeddings are populated
         self._reset_idx(None)
 
     # ------------------------------------------------------------------
@@ -152,7 +181,9 @@ class LangDroneEnv(DirectRLEnv):
 
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot)
-        self.scene.articulations["robot"] = self._robot
+
+        # Onboard camera — mounted on drone body, auto-updated by scene
+        self._camera = TiledCamera(self.cfg.tiled_camera)
 
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
@@ -184,15 +215,40 @@ class LangDroneEnv(DirectRLEnv):
             "/World/envs/env_.*/cylinder", cylinder_cfg, translation=_OBJ_OFFSETS[2]
         )
 
+        # Clone environments, then register assets and sensors
         self.scene.clone_environments(copy_from_source=False)
         if self.device == "cpu":
             self.scene.filter_collisions(global_prim_paths=[self.cfg.terrain.prim_path])
+
+        self.scene.articulations["robot"] = self._robot
+        self.scene.sensors["tiled_camera"] = self._camera
 
         light_cfg = sim_utils.DomeLightCfg(
             intensity=750.0,
             texture_file=f"{ISAAC_NUCLEUS_DIR}/Materials/Textures/Skies/PolyHaven/kloofendal_43d_clear_puresky_4k.hdr",
         )
         light_cfg.func("/World/Light", light_cfg)
+
+    # ------------------------------------------------------------------
+    # Vision encoding
+    # ------------------------------------------------------------------
+
+    def _update_camera_pose(self):
+        """Move the standalone camera prim to follow the drone body each step."""
+        drone_pos = self._robot.data.root_pos_w   # (N, 3)
+        drone_quat = self._robot.data.root_quat_w  # (N, 4) wxyz
+        # Apply body-frame offset to get camera world position
+        cam_pos = drone_pos + quat_apply(drone_quat, self._cam_offset.expand(self.num_envs, -1))
+        # Camera inherits drone orientation (forward-facing)
+        self._camera._view.set_world_poses(cam_pos, drone_quat)
+
+    def _maybe_encode_vision(self):
+        """Encode onboard camera images with CLIP every N steps."""
+        self._steps_since_encode += 1
+        if (self._steps_since_encode >= self.cfg.clip_encode_every_n).any():
+            rgb = self._camera.data.output["rgb"][:, :, :, :3]  # (N, 64, 64, 3) uint8
+            self._clip_img_emb = self._grounder.encode_images(rgb)
+            self._steps_since_encode.zero_()
 
     # ------------------------------------------------------------------
     # Physics step
@@ -205,6 +261,10 @@ class LangDroneEnv(DirectRLEnv):
         )
         self._moment[:, 0, :] = self.cfg.moment_scale * self._actions[:, 1:]
 
+        # Track drone with camera and encode vision periodically
+        self._update_camera_pose()
+        self._maybe_encode_vision()
+
     def _apply_action(self):
         self._robot.permanent_wrench_composer.set_forces_and_torques(
             body_ids=self._body_id, forces=self._thrust, torques=self._moment
@@ -215,28 +275,13 @@ class LangDroneEnv(DirectRLEnv):
     # ------------------------------------------------------------------
 
     def _get_observations(self) -> dict:
-        drone_pos = self._robot.data.root_pos_w  # (N, 3)
-        env_ids = torch.arange(self.num_envs, device=self.device)
-
-        # Target position in drone body frame
-        target_pos_w = self._obj_pos_w[env_ids, self._target_obj_idx]  # (N, 3)
-        target_pos_b, _ = subtract_frame_transforms(
-            self._robot.data.root_pos_w,
-            self._robot.data.root_quat_w,
-            target_pos_w,
-        )
-
-        # All object positions relative to drone (world frame, flattened)
-        obj_rel_pos = (self._obj_pos_w - drone_pos.unsqueeze(1)).reshape(self.num_envs, -1)  # (N, 9)
-
         obs = torch.cat(
             [
                 self._robot.data.root_lin_vel_b,        # (N, 3)
                 self._robot.data.root_ang_vel_b,        # (N, 3)
-                self._robot.data.projected_gravity_b,   # (N, 3)
-                target_pos_b,                           # (N, 3)  → total 12
+                self._robot.data.projected_gravity_b,   # (N, 3)  → total 9
                 self._clip_emb,                         # (N, 512)
-                obj_rel_pos,                            # (N, 9)
+                self._clip_img_emb,                     # (N, 512)
             ],
             dim=-1,
         )
@@ -349,3 +394,6 @@ class LangDroneEnv(DirectRLEnv):
 
         self._clip_emb[env_ids] = clip_embs.to(self.device)
         self._target_obj_idx[env_ids] = obj_type_indices.to(self.device)
+
+        # Force immediate vision encoding on next step for reset envs
+        self._steps_since_encode[env_ids] = self.cfg.clip_encode_every_n
