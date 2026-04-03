@@ -5,7 +5,7 @@
 # Tested on: GH200 (ARM64 H100), A10 (x86)
 #
 # Usage:
-#   git clone <your-drone-project-repo> ~/drone_project
+#   git clone https://github.com/CodCodingCode/drone_project.git ~/drone_project
 #   cd ~/drone_project
 #   bash setup.sh
 # =============================================================================
