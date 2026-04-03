@@ -1,5 +1,5 @@
 from isaaclab.utils import configclass
-from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg
+from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlRNNModelCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg
 
 
 @configclass
@@ -11,19 +11,27 @@ class LangDronePPORunnerCfg(RslRlOnPolicyRunnerCfg):
     logger = "wandb"
     wandb_project = "drone-lang-nav"
 
-    actor = RslRlMLPModelCfg(
+    # GRU actor — temporal memory for vision-language grounding
+    actor = RslRlRNNModelCfg(
         hidden_dims=[256, 256],
         activation="elu",
         obs_normalization=True,
+        rnn_type="gru",
+        rnn_hidden_dim=256,
+        rnn_num_layers=1,
         distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(
             init_std=0.6,
         ),
     )
 
-    critic = RslRlMLPModelCfg(
+    # GRU critic — same architecture
+    critic = RslRlRNNModelCfg(
         hidden_dims=[256, 256],
         activation="elu",
         obs_normalization=True,
+        rnn_type="gru",
+        rnn_hidden_dim=256,
+        rnn_num_layers=1,
     )
 
     algorithm = RslRlPpoAlgorithmCfg(

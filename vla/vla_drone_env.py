@@ -1,24 +1,14 @@
-"""Language-and-vision-grounded drone navigation environment (VLA).
+"""VLA drone navigation environment — PaliGemma end-to-end.
 
-The drone receives a natural language command ("go to the square") and an
-onboard camera image, and must navigate to the matching geometric object
-in the scene. Three colored objects are placed at fixed positions:
-  - Cube   (red)   at offset (-1.5,  0.0, 0.2) → index 0
-  - Sphere (blue)  at offset ( 1.5,  0.0, 0.2) → index 1
-  - Cylinder (green) at offset (0.0, 1.5, 0.2) → index 2
+Same scene, rewards, and physics as lang_nav, but instead of frozen CLIP
+embeddings, the env provides raw RGB images and tokenized text commands.
+PaliGemma processes these inside the policy network (vla_policy.py).
 
-Observation (1033-dim):
-  [0:3]     root_lin_vel_b
-  [3:6]     root_ang_vel_b
-  [6:9]     projected_gravity_b
-  [9:521]   CLIP text embedding of the command (512-dim, frozen)
-  [521:1033] CLIP image embedding from onboard camera (512-dim, frozen)
-
-Reward (two-phase: stability always active, navigation fades in):
-  Stability (always): alive bonus, uprightness, altitude penalty,
-      lin/ang velocity penalties
-  Navigation (gated): shaped distance-to-target, velocity-toward-goal,
-      proximity bonus, +10 success / -3 wrong-object
+Observation (multi-group dict):
+  "policy"      (N, 9)         flight state
+  "rgb"         (N, 64, 64, 3) raw camera image [0, 1] float
+  "text_tokens" (N, 32)        tokenized text command IDs
+  "text_mask"   (N, 32)        attention mask
 """
 
 from __future__ import annotations
@@ -27,45 +17,47 @@ import json
 import os
 import random
 
-import gymnasium as gym
 import torch
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, ArticulationCfg
 from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
+from isaaclab.markers import VisualizationMarkersCfg, VisualizationMarkers
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import TiledCamera, TiledCameraCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
-from isaaclab.markers import VisualizationMarkersCfg, VisualizationMarkers
-from isaaclab.utils.math import quat_apply, subtract_frame_transforms
+from isaaclab.utils.math import quat_apply
 
 from isaaclab_assets import CRAZYFLIE_CFG  # isort: skip
 
-from .clip_grounder import CLIPGrounder
-from .commands import COMMANDS, OBJECT_TYPES
+# Reuse command bank from lang_nav
+import sys
+_DRONE_PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _DRONE_PROJECT not in sys.path:
+    sys.path.insert(0, _DRONE_PROJECT)
+from lang_nav.commands import COMMANDS, OBJECT_TYPES
 
-# Fixed XYZ offsets for each object relative to env origin (cube, sphere, cylinder)
+# Fixed object offsets (same as lang_nav)
 _OBJ_OFFSETS = [(-1.5, 0.0, 0.2), (1.5, 0.0, 0.2), (0.0, 1.5, 0.2)]
 
-# CLIP embedding dimension (clip-vit-base-patch32)
-_CLIP_DIM = 512
+# Max tokenized text length for PaliGemma
+_MAX_TEXT_LEN = 32
 
 
 @configclass
-class LangDroneEnvCfg(DirectRLEnvCfg):
+class VLADroneEnvCfg(DirectRLEnvCfg):
     # Episode / stepping
     episode_length_s = 15.0
     decimation = 2
     action_space = 4
-    # 9 drone state + 512 CLIP text + 512 CLIP image
-    observation_space = 9 + _CLIP_DIM + _CLIP_DIM
+    observation_space = 9  # flight state only (base class needs an int; actual obs is a dict)
     state_space = 0
     debug_vis = False
 
-    # Simulation
+    # Simulation (identical to lang_nav)
     sim: SimulationCfg = SimulationCfg(
         dt=1 / 100,
         render_interval=decimation,
@@ -93,17 +85,15 @@ class LangDroneEnvCfg(DirectRLEnvCfg):
         debug_vis=False,
     )
 
-    # Larger env spacing so objects don't overlap between envs
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=1024, env_spacing=6.0, replicate_physics=True
+        num_envs=256, env_spacing=6.0, replicate_physics=True,
     )
 
     robot: ArticulationCfg = CRAZYFLIE_CFG.replace(prim_path="/World/envs/env_.*/Robot")
     thrust_to_weight = 1.9
     moment_scale = 0.01
 
-    # Onboard camera (64x64, resized to 224x224 for CLIP)
-    # Spawned at env level; pose updated each step to follow drone body
+    # Onboard camera (64x64 RGB)
     tiled_camera: TiledCameraCfg = TiledCameraCfg(
         prim_path="/World/envs/env_.*/Camera",
         offset=TiledCameraCfg.OffsetCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0), convention="world"),
@@ -117,11 +107,14 @@ class LangDroneEnvCfg(DirectRLEnvCfg):
         width=64,
         height=64,
     )
-    # Camera offset from drone body centre (forward + slightly up)
     camera_body_offset_pos = (0.05, 0.0, 0.01)
 
-    # How often to run CLIP image encoding (every N physics steps)
-    clip_encode_every_n = 5
+    # How often to grab camera frames (every N physics steps)
+    camera_every_n = 3
+
+    # PaliGemma tokenizer name (lightweight, no model weights loaded in env)
+    tokenizer_name = "google/paligemma-3b-pt-224"
+    max_text_length = _MAX_TEXT_LEN
 
     # Reward scales — stability (always active)
     lin_vel_reward_scale = -0.02
@@ -132,7 +125,7 @@ class LangDroneEnvCfg(DirectRLEnvCfg):
     altitude_warning_high = 2.8
     crash_penalty_scale = -10.0
 
-    # Reward scales — navigation (gated by nav_multiplier during warmup)
+    # Reward scales — navigation (gated by nav_multiplier)
     distance_to_goal_reward_scale = 25.0
     velocity_toward_goal_scale = 4.0
     proximity_scale = 8.0
@@ -140,18 +133,17 @@ class LangDroneEnvCfg(DirectRLEnvCfg):
     success_reward = 10.0
     wrong_object_penalty = -3.0
 
-    # Task parameters
-    success_threshold = 0.35  # metres — drone must get this close to target
+    success_threshold = 0.35
 
-    # Two-phase learning: stabilise hover first, then fade in navigation
+    # Two-phase learning
     survival_only_steps = 3000
     nav_fadein_steps = 10000
 
 
-class LangDroneEnv(DirectRLEnv):
-    cfg: LangDroneEnvCfg
+class VLADroneEnv(DirectRLEnv):
+    cfg: VLADroneEnvCfg
 
-    def __init__(self, cfg: LangDroneEnvCfg, render_mode: str | None = None, **kwargs):
+    def __init__(self, cfg: VLADroneEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
 
         # Action / thrust buffers
@@ -161,28 +153,30 @@ class LangDroneEnv(DirectRLEnv):
 
         # Per-env language state
         self._target_obj_idx = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
-        self._clip_emb = torch.zeros(self.num_envs, _CLIP_DIM, device=self.device)
         self._current_commands: list[str] = [""] * self.num_envs
 
-        # Per-env vision state (cached CLIP image embedding)
-        self._clip_img_emb = torch.zeros(self.num_envs, _CLIP_DIM, device=self.device)
-        self._steps_since_encode = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        # Tokenized text (pre-computed at reset, reused every step)
+        self._text_tokens = torch.zeros(self.num_envs, self.cfg.max_text_length, dtype=torch.long, device=self.device)
+        self._text_mask = torch.zeros(self.num_envs, self.cfg.max_text_length, dtype=torch.long, device=self.device)
 
-        # Camera body-frame offset (constant, used to position camera relative to drone)
+        # Cached camera image (updated every N steps)
+        self._cached_rgb = torch.zeros(self.num_envs, 64, 64, 3, dtype=torch.float32, device=self.device)
+        self._steps_since_capture = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+
+        # Camera body-frame offset
         self._cam_offset = torch.tensor(self.cfg.camera_body_offset_pos, dtype=torch.float32, device=self.device)
 
-        # World positions of all 3 objects for every env: (num_envs, 3, 3)
-        # Kept for reward/done computation (ground truth, not in obs)
+        # World positions of all 3 objects: (num_envs, 3, 3)
         offsets = torch.tensor(_OBJ_OFFSETS, dtype=torch.float32, device=self.device)
         self._obj_pos_w = self._terrain.env_origins.unsqueeze(1) + offsets.unsqueeze(0)
 
-        # Robot dynamics constants
+        # Robot dynamics
         self._body_id = self._robot.find_bodies("body")[0]
         self._robot_mass = self._robot.root_physx_view.get_masses()[0].sum()
         self._gravity_magnitude = torch.tensor(self.sim.cfg.gravity, device=self.device).norm()
         self._robot_weight = (self._robot_mass * self._gravity_magnitude).item()
 
-        # Logging accumulators
+        # Logging
         self._episode_sums = {
             k: torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
             for k in [
@@ -192,62 +186,56 @@ class LangDroneEnv(DirectRLEnv):
             ]
         }
 
-        # CLIP grounder — loaded once, frozen (text + vision)
-        self._grounder = CLIPGrounder(device=self.device)
-
-        # Metrics log file — JSONL format for easy parsing during training
+        # Metrics file
         self._metrics_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "logs", "lang_nav_metrics.jsonl",
+            "logs", "vla_metrics.jsonl",
         )
         os.makedirs(os.path.dirname(self._metrics_path), exist_ok=True)
         self._metrics_file = open(self._metrics_path, "w")
         self._log_step = 0
 
-        # Warm up with a full-env reset so CLIP text embeddings are populated
+        # Load PaliGemma tokenizer (lightweight, no model weights)
+        from transformers import AutoTokenizer
+        print("[VLA Env] Loading PaliGemma tokenizer...")
+        self._tokenizer = AutoTokenizer.from_pretrained(self.cfg.tokenizer_name)
+        print("[VLA Env] Tokenizer loaded.")
+
+        # Initial reset
         self._reset_idx(None)
 
     # ------------------------------------------------------------------
-    # Scene setup
+    # Scene setup (identical to lang_nav)
     # ------------------------------------------------------------------
 
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot)
-
-        # Onboard camera — mounted on drone body, auto-updated by scene
         self._camera = TiledCamera(self.cfg.tiled_camera)
 
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
         self._terrain = self.cfg.terrain.class_type(self.cfg.terrain)
 
-        # Spawn visual-only geometric objects (no rigid body / physics needed)
+        # Spawn objects (same as lang_nav)
         cube_cfg = sim_utils.CuboidCfg(
             size=(0.4, 0.4, 0.4),
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.8, 0.1, 0.1)),
         )
-        cube_cfg.func(
-            "/World/envs/env_.*/cube", cube_cfg, translation=_OBJ_OFFSETS[0]
-        )
+        cube_cfg.func("/World/envs/env_.*/cube", cube_cfg, translation=_OBJ_OFFSETS[0])
 
         sphere_cfg = sim_utils.SphereCfg(
             radius=0.2,
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 0.1, 0.8)),
         )
-        sphere_cfg.func(
-            "/World/envs/env_.*/sphere", sphere_cfg, translation=_OBJ_OFFSETS[1]
-        )
+        sphere_cfg.func("/World/envs/env_.*/sphere", sphere_cfg, translation=_OBJ_OFFSETS[1])
 
         cylinder_cfg = sim_utils.CylinderCfg(
-            radius=0.2,
-            height=0.5,
+            radius=0.2, height=0.5,
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 0.8, 0.1)),
         )
-        cylinder_cfg.func(
-            "/World/envs/env_.*/cylinder", cylinder_cfg, translation=_OBJ_OFFSETS[2]
-        )
+        cylinder_cfg.func("/World/envs/env_.*/cylinder", cylinder_cfg, translation=_OBJ_OFFSETS[2])
 
-        # Coloured corner markers for spatial reference (matches hover/waypoint)
+        # Corner markers
         for pos, color, name in [
             ((2.0, 0.0, 0.15), (0.8, 0.1, 0.1), "marker_red"),
             ((-2.0, 0.0, 0.15), (0.1, 0.1, 0.8), "marker_blue"),
@@ -255,13 +243,11 @@ class LangDroneEnv(DirectRLEnv):
             ((0.0, -2.0, 0.15), (0.8, 0.8, 0.1), "marker_yellow"),
         ]:
             m_cfg = sim_utils.CylinderCfg(
-                radius=0.08,
-                height=0.3,
+                radius=0.08, height=0.3,
                 visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=color),
             )
             m_cfg.func(f"/World/envs/env_.*/{name}", m_cfg, translation=pos)
 
-        # Clone environments, then register assets and sensors
         self.scene.clone_environments(copy_from_source=False)
         if self.device == "cpu":
             self.scene.filter_collisions(global_prim_paths=[self.cfg.terrain.prim_path])
@@ -277,7 +263,6 @@ class LangDroneEnv(DirectRLEnv):
         dist_light = sim_utils.DistantLightCfg(intensity=800.0, color=(1.0, 0.95, 0.85))
         dist_light.func("/World/SunLight", dist_light)
 
-        # Dynamic target marker — glowing sphere above the current target object
         self._target_marker = VisualizationMarkers(VisualizationMarkersCfg(
             prim_path="/World/Visuals/target_marker",
             markers={
@@ -293,39 +278,31 @@ class LangDroneEnv(DirectRLEnv):
         ))
 
     # ------------------------------------------------------------------
-    # Vision encoding
+    # Camera
     # ------------------------------------------------------------------
 
     def _update_camera_pose(self):
-        """Move the standalone camera prim to follow the drone body each step."""
-        drone_pos = self._robot.data.root_pos_w   # (N, 3)
-        drone_quat = self._robot.data.root_quat_w  # (N, 4) wxyz
-        # Apply body-frame offset to get camera world position
+        drone_pos = self._robot.data.root_pos_w
+        drone_quat = self._robot.data.root_quat_w
         cam_pos = drone_pos + quat_apply(drone_quat, self._cam_offset.expand(self.num_envs, -1))
-        # Camera inherits drone orientation (forward-facing)
         self._camera._view.set_world_poses(cam_pos, drone_quat)
 
-    def _maybe_encode_vision(self):
-        """Encode onboard camera images with CLIP every N steps."""
-        self._steps_since_encode += 1
-        if (self._steps_since_encode >= self.cfg.clip_encode_every_n).any():
+    def _maybe_capture_camera(self):
+        self._steps_since_capture += 1
+        if (self._steps_since_capture >= self.cfg.camera_every_n).any():
             rgb = self._camera.data.output["rgb"][:, :, :, :3]  # (N, 64, 64, 3) uint8
-            self._clip_img_emb = self._grounder.encode_images(rgb)
-            self._steps_since_encode.zero_()
+            self._cached_rgb = rgb.float() / 255.0  # → [0, 1]
+            self._steps_since_capture.zero_()
 
     # ------------------------------------------------------------------
     # Two-phase learning
     # ------------------------------------------------------------------
 
     def _get_nav_multiplier(self) -> float:
-        """0.0 during survival-only phase, linearly ramps to 1.0 during fade-in."""
         steps = self.common_step_counter
         if steps < self.cfg.survival_only_steps:
             return 0.0
-        fade_progress = min(
-            (steps - self.cfg.survival_only_steps) / self.cfg.nav_fadein_steps, 1.0
-        )
-        return fade_progress
+        return min((steps - self.cfg.survival_only_steps) / self.cfg.nav_fadein_steps, 1.0)
 
     # ------------------------------------------------------------------
     # Physics step
@@ -337,10 +314,8 @@ class LangDroneEnv(DirectRLEnv):
             self.cfg.thrust_to_weight * self._robot_weight * (self._actions[:, 0] + 1.0) / 2.0
         )
         self._moment[:, 0, :] = self.cfg.moment_scale * self._actions[:, 1:]
-
-        # Track drone with camera and encode vision periodically
         self._update_camera_pose()
-        self._maybe_encode_vision()
+        self._maybe_capture_camera()
 
     def _apply_action(self):
         self._robot.permanent_wrench_composer.set_forces_and_torques(
@@ -348,27 +323,32 @@ class LangDroneEnv(DirectRLEnv):
         )
 
     # ------------------------------------------------------------------
-    # MDP components
+    # Observations (multi-group dict for VLA)
     # ------------------------------------------------------------------
 
     def _get_observations(self) -> dict:
-        # Update target marker above the current target object
+        # Update target marker
         env_ids = torch.arange(self.num_envs, device=self.device)
         marker_pos = self._obj_pos_w[env_ids, self._target_obj_idx].clone()
         marker_pos[:, 2] += 0.7
         self._target_marker.visualize(translations=marker_pos)
 
-        obs = torch.cat(
-            [
-                self._robot.data.root_lin_vel_b,        # (N, 3)
-                self._robot.data.root_ang_vel_b,        # (N, 3)
-                self._robot.data.projected_gravity_b,   # (N, 3)  → total 9
-                self._clip_emb,                         # (N, 512)
-                self._clip_img_emb,                     # (N, 512)
-            ],
-            dim=-1,
-        )
-        return {"policy": obs}
+        flight_state = torch.cat([
+            self._robot.data.root_lin_vel_b,       # (N, 3)
+            self._robot.data.root_ang_vel_b,       # (N, 3)
+            self._robot.data.projected_gravity_b,   # (N, 3)
+        ], dim=-1)  # (N, 9)
+
+        return {
+            "policy": flight_state,              # (N, 9)
+            "rgb": self._cached_rgb,             # (N, 64, 64, 3) float [0,1]
+            "text_tokens": self._text_tokens,    # (N, 32) long
+            "text_mask": self._text_mask,        # (N, 32) long
+        }
+
+    # ------------------------------------------------------------------
+    # Rewards (identical to lang_nav)
+    # ------------------------------------------------------------------
 
     def _get_rewards(self) -> torch.Tensor:
         env_ids = torch.arange(self.num_envs, device=self.device)
@@ -379,24 +359,19 @@ class LangDroneEnv(DirectRLEnv):
         dist_to_target = torch.linalg.norm(to_goal, dim=1)
         dist_mapped = 1.0 - torch.tanh(dist_to_target / 0.8)
 
-        # Velocity toward goal (world frame)
         to_goal_dir = to_goal / dist_to_target.unsqueeze(1).clamp(min=0.01)
         vel_toward = torch.sum(self._robot.data.root_lin_vel_w * to_goal_dir, dim=1)
         vel_toward_clamp = torch.clamp(vel_toward, 0.0, 2.0)
 
-        # Proximity bonus: linear ramp inside radius
         inside_radius = (dist_to_target < self.cfg.proximity_radius).float()
         proximity = inside_radius * (1.0 - dist_to_target / self.cfg.proximity_radius)
 
-        # Uprightness: +1 when level, -1 when inverted
         uprightness = -self._robot.data.projected_gravity_b[:, 2]
 
-        # Altitude warning: soft penalty near floor/ceiling
         too_low = torch.clamp(self.cfg.altitude_warning_low - drone_pos[:, 2], min=0.0)
         too_high = torch.clamp(drone_pos[:, 2] - self.cfg.altitude_warning_high, min=0.0)
         altitude_penalty = (too_low + too_high) * self.cfg.crash_penalty_scale
 
-        # Minimum distance to any wrong object
         wrong_mask = torch.ones(self.num_envs, 3, dtype=torch.bool, device=self.device)
         wrong_mask[env_ids, self._target_obj_idx] = False
         wrong_obj_pos = self._obj_pos_w[wrong_mask].reshape(self.num_envs, 2, 3)
@@ -407,34 +382,17 @@ class LangDroneEnv(DirectRLEnv):
         success = dist_to_target < self.cfg.success_threshold
         wrong_object = dist_to_wrong < self.cfg.success_threshold
 
-        # Two-phase: navigation rewards are zero during survival phase
         nav = self._get_nav_multiplier()
 
         rewards = {
-            # Stability rewards — always active (preserve pretrained hover)
-            "lin_vel": (
-                torch.sum(torch.square(self._robot.data.root_lin_vel_b), dim=1)
-                * self.cfg.lin_vel_reward_scale
-                * self.step_dt
-            ),
-            "ang_vel": (
-                torch.sum(torch.square(self._robot.data.root_ang_vel_b), dim=1)
-                * self.cfg.ang_vel_reward_scale
-                * self.step_dt
-            ),
-            "alive": (
-                torch.ones(self.num_envs, device=self.device)
-                * self.cfg.alive_reward
-                * self.step_dt
-            ),
+            "lin_vel": torch.sum(torch.square(self._robot.data.root_lin_vel_b), dim=1) * self.cfg.lin_vel_reward_scale * self.step_dt,
+            "ang_vel": torch.sum(torch.square(self._robot.data.root_ang_vel_b), dim=1) * self.cfg.ang_vel_reward_scale * self.step_dt,
+            "alive": torch.ones(self.num_envs, device=self.device) * self.cfg.alive_reward * self.step_dt,
             "uprightness": uprightness * self.cfg.uprightness_reward_scale * self.step_dt,
             "altitude_penalty": altitude_penalty * self.step_dt,
-            # Navigation rewards — always active (waypoint learned with these;
-            # gating them kills the transferred nav skill)
             "distance_to_goal": dist_mapped * self.cfg.distance_to_goal_reward_scale * self.step_dt,
             "velocity_toward_goal": vel_toward_clamp * self.cfg.velocity_toward_goal_scale * self.step_dt,
             "proximity": proximity * self.cfg.proximity_scale * self.step_dt,
-            # CLIP-dependent rewards — gated (these are NEW skills the VLA must learn)
             "success": success.float() * self.cfg.success_reward * nav,
             "wrong_object": wrong_object.float() * self.cfg.wrong_object_penalty * nav,
         }
@@ -443,6 +401,10 @@ class LangDroneEnv(DirectRLEnv):
         for k, v in rewards.items():
             self._episode_sums[k] += v
         return reward
+
+    # ------------------------------------------------------------------
+    # Termination (identical to lang_nav)
+    # ------------------------------------------------------------------
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         env_ids = torch.arange(self.num_envs, device=self.device)
@@ -466,6 +428,10 @@ class LangDroneEnv(DirectRLEnv):
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         return terminated, time_out
 
+    # ------------------------------------------------------------------
+    # Reset
+    # ------------------------------------------------------------------
+
     def _reset_idx(self, env_ids: torch.Tensor | None):
         if env_ids is None or len(env_ids) == self.num_envs:
             env_ids = self._robot._ALL_INDICES
@@ -479,7 +445,6 @@ class LangDroneEnv(DirectRLEnv):
         extras["Curriculum/nav_multiplier"] = self._get_nav_multiplier()
         self.extras["log"] = extras
 
-        # Write to metrics JSONL (every 50 reset calls to limit I/O)
         self._log_step += 1
         if self._log_step % 50 == 0:
             row = {k: float(v) if isinstance(v, (int, float)) else float(v.item()) for k, v in extras.items()}
@@ -506,20 +471,29 @@ class LangDroneEnv(DirectRLEnv):
         self._robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
 
-        # Sample new language commands and encode with CLIP
+        # Sample new commands and tokenize for PaliGemma
         n = len(env_ids)
-        obj_type_indices = torch.randint(0, len(OBJECT_TYPES), (n,))  # ground truth targets
+        obj_type_indices = torch.randint(0, len(OBJECT_TYPES), (n,))
 
         commands = [
             random.choice(COMMANDS[OBJECT_TYPES[i.item()]])
             for i in obj_type_indices
         ]
-        clip_embs = self._grounder.encode_texts(commands)  # (n, 512)
 
-        self._clip_emb[env_ids] = clip_embs.to(self.device)
+        # Tokenize with PaliGemma tokenizer
+        tokenized = self._tokenizer(
+            commands,
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            max_length=self.cfg.max_text_length,
+        )
+
+        self._text_tokens[env_ids] = tokenized["input_ids"].to(self.device)
+        self._text_mask[env_ids] = tokenized["attention_mask"].to(self.device)
         self._target_obj_idx[env_ids] = obj_type_indices.to(self.device)
         for i, eid in enumerate(env_ids):
             self._current_commands[int(eid)] = commands[i]
 
-        # Force immediate vision encoding on next step for reset envs
-        self._steps_since_encode[env_ids] = self.cfg.clip_encode_every_n
+        # Force camera capture on next step
+        self._steps_since_capture[env_ids] = self.cfg.camera_every_n
