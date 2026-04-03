@@ -66,6 +66,75 @@ import lang_nav  # noqa: F401 — registers Isaac-LangDrone-Direct-v0
 from lang_nav.lang_drone_env import LangDroneEnvCfg
 from lang_nav.agents.rsl_rl_ppo_cfg import LangDronePPORunnerCfg
 
+import cv2
+import numpy as np
+
+
+class TextOverlayWrapper(gym.Wrapper):
+    """Burn command text + onboard camera PiP onto rendered video frames."""
+
+    _PIP_SCALE = 3  # upscale 64x64 → 192x192
+    _PIP_MARGIN = 16
+    _PIP_BORDER = 2
+
+    def render(self):
+        frame = self.env.render()
+        if frame is None:
+            return frame
+
+        unwrapped = self.unwrapped
+        frame = np.ascontiguousarray(frame)
+        h, w = frame.shape[:2]
+
+        # --- Command text banner at the top ---
+        cmd = ""
+        if hasattr(unwrapped, "_current_commands") and unwrapped._current_commands:
+            cmd = unwrapped._current_commands[0]
+        if cmd:
+            text = f'Command: "{cmd}"'
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            scale, thickness = 1.2, 2
+            (tw, th), baseline = cv2.getTextSize(text, font, scale, thickness)
+            banner_h = th + baseline + 30
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (0, 0), (w, banner_h), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+            x = (w - tw) // 2
+            y = th + 15
+            cv2.putText(frame, text, (x, y), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+        # --- Onboard camera PiP (bottom-right corner) ---
+        if hasattr(unwrapped, "_camera"):
+            try:
+                rgb = unwrapped._camera.data.output["rgb"][0, :, :, :3]  # (64, 64, 3)
+                pip = rgb.cpu().numpy().astype(np.uint8)
+                pip_size = pip.shape[0] * self._PIP_SCALE  # 192
+                pip = cv2.resize(pip, (pip_size, pip_size), interpolation=cv2.INTER_NEAREST)
+
+                # Position: bottom-right with margin
+                m = self._PIP_MARGIN
+                b = self._PIP_BORDER
+                y1 = h - m - pip_size
+                x1 = w - m - pip_size
+
+                # White border
+                frame[y1 - b : y1 + pip_size + b, x1 - b : x1 + pip_size + b] = 255
+                # Inset the PiP
+                frame[y1 : y1 + pip_size, x1 : x1 + pip_size] = pip
+
+                # Label above PiP
+                label = "Drone Camera"
+                lscale, lthick = 0.6, 1
+                (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, lscale, lthick)
+                lx = x1 + (pip_size - lw) // 2
+                ly = y1 - b - 6
+                cv2.putText(frame, label, (lx, ly), cv2.FONT_HERSHEY_SIMPLEX, lscale,
+                            (255, 255, 255), lthick, cv2.LINE_AA)
+            except Exception:
+                pass  # camera not ready during warmup
+
+        return frame
+
 
 def main():
     ckpt_path = os.path.abspath(args_cli.checkpoint)
@@ -75,8 +144,19 @@ def main():
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.sim.device = args_cli.device if args_cli.device else "cuda:0"
 
-    if args_cli.video:
-        env_cfg.sim.render_interval = 1
+    # Render every physics step for smooth video
+    env_cfg.sim.render_interval = 1
+    env_cfg.decimation = 1
+
+    # Quality rendering — denoiser + DLAA to eliminate noise/grain
+    from isaaclab.sim import RenderCfg
+    env_cfg.sim.render = RenderCfg(
+        enable_dl_denoiser=True,
+        antialiasing_mode="DLAA",
+        dome_light_upper_lower_strategy=4,
+        enable_direct_lighting=True,
+        samples_per_pixel=2,
+    )
 
     # Camera tracks the drone, wide enough to see the 3 objects
     env_cfg.viewer.origin_type = "asset_root"
@@ -99,6 +179,13 @@ def main():
         env = gym.make("Isaac-LangDrone-Direct-v0", cfg=env_cfg, render_mode="rgb_array")
     else:
         env = gym.make("Isaac-LangDrone-Direct-v0", cfg=env_cfg)
+
+    # Encode at 50fps — 0.5x slow-mo (smooth & cinematic)
+    env.metadata["render_fps"] = 50
+
+    # Overlay command text on rendered frames
+    if args_cli.video:
+        env = TextOverlayWrapper(env)
 
     # Wrap with RecordVideo then RSL-RL wrapper
     if args_cli.video:

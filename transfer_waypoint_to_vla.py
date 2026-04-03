@@ -18,7 +18,6 @@ Usage:
 """
 
 import argparse
-import math
 import os
 
 import torch
@@ -32,14 +31,12 @@ SHARED_OBS_DIMS = 9  # lin_vel(3) + ang_vel(3) + projected_gravity(3)
 def _expand_input_weight(param, new_cols, shared_cols):
     """Expand input weight matrix from (256, 15) to (256, 1033).
 
-    First 9 columns are copied (flight state). Everything else is
-    Kaiming-initialized.
+    First 9 columns are copied (flight state). CLIP columns are
+    zero-initialized so the first hidden layer initially ignores them,
+    preserving the pretrained hover/nav behaviour on day one.
     """
     rows = param.shape[0]
     new = torch.zeros(rows, new_cols)
-    fan_in = new_cols
-    bound = math.sqrt(1.0 / fan_in)
-    torch.nn.init.uniform_(new, -bound, bound)
     # Copy shared flight state columns
     new[:, :shared_cols] = param[:, :shared_cols]
     return new
@@ -71,6 +68,12 @@ def transfer(waypoint_path: str, output_path: str):
 
             elif key in ("obs_normalizer._var", "obs_normalizer._std"):
                 new_state[key] = _expand_obs_normalizer(param, VLA_OBS_DIM, SHARED_OBS_DIMS, 1.0)
+
+            elif key == "obs_normalizer._count":
+                # Reset count so the normalizer adapts quickly to CLIP
+                # embedding statistics (flight dims re-converge fast since
+                # the physics are identical).
+                new_state[key] = torch.tensor(100.0)
 
             else:
                 new_state[key] = param.clone()

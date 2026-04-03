@@ -14,11 +14,11 @@ Observation (1033-dim):
   [9:521]   CLIP text embedding of the command (512-dim, frozen)
   [521:1033] CLIP image embedding from onboard camera (512-dim, frozen)
 
-Reward:
-  + shaped distance-to-target
-  - lin/ang velocity penalties (stability)
-  + 5.0 success bonus  (drone reaches target, episode ends)
-  - 3.0 wrong-object penalty (drone reaches wrong object, episode ends)
+Reward (two-phase: stability always active, navigation fades in):
+  Stability (always): alive bonus, uprightness, altitude penalty,
+      lin/ang velocity penalties
+  Navigation (gated): shaped distance-to-target, velocity-toward-goal,
+      proximity bonus, +10 success / -3 wrong-object
 """
 
 from __future__ import annotations
@@ -121,15 +121,29 @@ class LangDroneEnvCfg(DirectRLEnvCfg):
     # How often to run CLIP image encoding (every N physics steps)
     clip_encode_every_n = 5
 
-    # Reward scales
-    lin_vel_reward_scale = -0.05
-    ang_vel_reward_scale = -0.01
-    distance_to_goal_reward_scale = 15.0
-    success_reward = 5.0
+    # Reward scales — stability (always active)
+    lin_vel_reward_scale = -0.02
+    ang_vel_reward_scale = -0.005
+    alive_reward = 1.5
+    uprightness_reward_scale = 0.5
+    altitude_warning_low = 0.3
+    altitude_warning_high = 2.8
+    crash_penalty_scale = -10.0
+
+    # Reward scales — navigation (gated by nav_multiplier during warmup)
+    distance_to_goal_reward_scale = 25.0
+    velocity_toward_goal_scale = 4.0
+    proximity_scale = 8.0
+    proximity_radius = 1.5
+    success_reward = 10.0
     wrong_object_penalty = -3.0
 
     # Task parameters
     success_threshold = 0.35  # metres — drone must get this close to target
+
+    # Two-phase learning: stabilise hover first, then fade in navigation
+    survival_only_steps = 3000
+    nav_fadein_steps = 10000
 
 
 class LangDroneEnv(DirectRLEnv):
@@ -146,6 +160,7 @@ class LangDroneEnv(DirectRLEnv):
         # Per-env language state
         self._target_obj_idx = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self._clip_emb = torch.zeros(self.num_envs, _CLIP_DIM, device=self.device)
+        self._current_commands: list[str] = [""] * self.num_envs
 
         # Per-env vision state (cached CLIP image embedding)
         self._clip_img_emb = torch.zeros(self.num_envs, _CLIP_DIM, device=self.device)
@@ -168,7 +183,11 @@ class LangDroneEnv(DirectRLEnv):
         # Logging accumulators
         self._episode_sums = {
             k: torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
-            for k in ["lin_vel", "ang_vel", "distance_to_goal", "success", "wrong_object"]
+            for k in [
+                "lin_vel", "ang_vel", "alive", "uprightness", "altitude_penalty",
+                "distance_to_goal", "velocity_toward_goal", "proximity",
+                "success", "wrong_object",
+            ]
         }
 
         # CLIP grounder — loaded once, frozen (text + vision)
@@ -284,6 +303,20 @@ class LangDroneEnv(DirectRLEnv):
             self._steps_since_encode.zero_()
 
     # ------------------------------------------------------------------
+    # Two-phase learning
+    # ------------------------------------------------------------------
+
+    def _get_nav_multiplier(self) -> float:
+        """0.0 during survival-only phase, linearly ramps to 1.0 during fade-in."""
+        steps = self.common_step_counter
+        if steps < self.cfg.survival_only_steps:
+            return 0.0
+        fade_progress = min(
+            (steps - self.cfg.survival_only_steps) / self.cfg.nav_fadein_steps, 1.0
+        )
+        return fade_progress
+
+    # ------------------------------------------------------------------
     # Physics step
     # ------------------------------------------------------------------
 
@@ -331,8 +364,26 @@ class LangDroneEnv(DirectRLEnv):
         drone_pos = self._robot.data.root_pos_w
 
         target_pos = self._obj_pos_w[env_ids, self._target_obj_idx]
-        dist_to_target = torch.linalg.norm(target_pos - drone_pos, dim=1)
+        to_goal = target_pos - drone_pos
+        dist_to_target = torch.linalg.norm(to_goal, dim=1)
         dist_mapped = 1.0 - torch.tanh(dist_to_target / 0.8)
+
+        # Velocity toward goal (world frame)
+        to_goal_dir = to_goal / dist_to_target.unsqueeze(1).clamp(min=0.01)
+        vel_toward = torch.sum(self._robot.data.root_lin_vel_w * to_goal_dir, dim=1)
+        vel_toward_clamp = torch.clamp(vel_toward, 0.0, 2.0)
+
+        # Proximity bonus: linear ramp inside radius
+        inside_radius = (dist_to_target < self.cfg.proximity_radius).float()
+        proximity = inside_radius * (1.0 - dist_to_target / self.cfg.proximity_radius)
+
+        # Uprightness: +1 when level, -1 when inverted
+        uprightness = -self._robot.data.projected_gravity_b[:, 2]
+
+        # Altitude warning: soft penalty near floor/ceiling
+        too_low = torch.clamp(self.cfg.altitude_warning_low - drone_pos[:, 2], min=0.0)
+        too_high = torch.clamp(drone_pos[:, 2] - self.cfg.altitude_warning_high, min=0.0)
+        altitude_penalty = (too_low + too_high) * self.cfg.crash_penalty_scale
 
         # Minimum distance to any wrong object
         wrong_mask = torch.ones(self.num_envs, 3, dtype=torch.bool, device=self.device)
@@ -345,7 +396,11 @@ class LangDroneEnv(DirectRLEnv):
         success = dist_to_target < self.cfg.success_threshold
         wrong_object = dist_to_wrong < self.cfg.success_threshold
 
+        # Two-phase: navigation rewards are zero during survival phase
+        nav = self._get_nav_multiplier()
+
         rewards = {
+            # Stability rewards — always active (preserve pretrained hover)
             "lin_vel": (
                 torch.sum(torch.square(self._robot.data.root_lin_vel_b), dim=1)
                 * self.cfg.lin_vel_reward_scale
@@ -356,11 +411,21 @@ class LangDroneEnv(DirectRLEnv):
                 * self.cfg.ang_vel_reward_scale
                 * self.step_dt
             ),
-            "distance_to_goal": (
-                dist_mapped * self.cfg.distance_to_goal_reward_scale * self.step_dt
+            "alive": (
+                torch.ones(self.num_envs, device=self.device)
+                * self.cfg.alive_reward
+                * self.step_dt
             ),
-            "success": success.float() * self.cfg.success_reward,
-            "wrong_object": wrong_object.float() * self.cfg.wrong_object_penalty,
+            "uprightness": uprightness * self.cfg.uprightness_reward_scale * self.step_dt,
+            "altitude_penalty": altitude_penalty * self.step_dt,
+            # Navigation rewards — always active (waypoint learned with these;
+            # gating them kills the transferred nav skill)
+            "distance_to_goal": dist_mapped * self.cfg.distance_to_goal_reward_scale * self.step_dt,
+            "velocity_toward_goal": vel_toward_clamp * self.cfg.velocity_toward_goal_scale * self.step_dt,
+            "proximity": proximity * self.cfg.proximity_scale * self.step_dt,
+            # CLIP-dependent rewards — gated (these are NEW skills the VLA must learn)
+            "success": success.float() * self.cfg.success_reward * nav,
+            "wrong_object": wrong_object.float() * self.cfg.wrong_object_penalty * nav,
         }
 
         reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
@@ -433,6 +498,8 @@ class LangDroneEnv(DirectRLEnv):
 
         self._clip_emb[env_ids] = clip_embs.to(self.device)
         self._target_obj_idx[env_ids] = obj_type_indices.to(self.device)
+        for i, eid in enumerate(env_ids):
+            self._current_commands[int(eid)] = commands[i]
 
         # Force immediate vision encoding on next step for reset envs
         self._steps_since_encode[env_ids] = self.cfg.clip_encode_every_n
