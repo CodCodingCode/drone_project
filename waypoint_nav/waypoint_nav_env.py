@@ -91,44 +91,37 @@ class WaypointNavEnvCfg(DirectRLEnvCfg):
     thrust_to_weight = 1.9
     moment_scale = 0.01
 
-    # Reward scales — split XY/Z for clearer gradient signal
+    # Reward scales — simplified, no phase curriculum
     xy_reward_scale = 10.0
     z_reward_scale = 6.0
-    velocity_toward_goal_scale = 4.0   # immediate signal for moving toward goal
-    uprightness_reward_scale = 0.5     # reduced from hover's 2.0 — allow tilting
-    lin_vel_penalty_scale = -0.01      # reduced from -0.05 — stop fighting navigation
-    ang_vel_penalty_scale = -0.01      # same as hover and lang_nav
-    alive_reward = 0.5                 # raised from 0.2 — match hover
-    success_reward = 50.0              # quality-gated + distance-scaled
-    success_threshold = 0.6            # drone gets to 0.50m — give room to trigger + distance scaling pushes closer
-    proximity_scale = 8.0              # sharp bonus within 1.5m — bridges tanh saturation gap
-    proximity_radius = 1.5             # metres — proximity bonus kicks in inside this radius
+    velocity_toward_goal_scale = 4.0
+    uprightness_reward_scale = 0.5
+    lin_vel_penalty_scale = -0.01
+    ang_vel_penalty_scale = -0.01
+    alive_reward = 2.0                 # boosted from 0.5 — survival must compete with navigation
+    success_reward = 50.0              # quality-gated, on waypoint reach
+    proximity_scale = 8.0
+    proximity_radius = 1.5
+    pinpoint_scale = 20.0
+    pinpoint_radius = 0.5
+    crash_penalty_scale = -15.0        # penalty for being near ground/ceiling
+    altitude_warning_low = 0.3         # soft penalty below this height
+    altitude_warning_high = 2.8        # soft penalty above this height
 
-    # Out-of-bounds termination (hover has this, was missing here)
+    # Threshold curriculum — starts easy, tightens as the drone improves
+    success_threshold_start = 1.0
+    success_threshold_end = 0.15
+    success_threshold_ramp_steps = 40_000
+
+    # Out-of-bounds termination
     xy_boundary = 5.0
 
-    # Goal distance curriculum — start close (like hover), ramp to full difficulty
-    curriculum_start_min = 0.5   # metres
-    curriculum_start_max = 1.5   # metres
-    curriculum_end_min = 1.0     # metres
-    curriculum_end_max = 3.0     # metres
-    curriculum_ramp_steps = 60_000  # env steps to reach full difficulty
-
-    # Reward curriculum — phase objectives so drone masters approach before landing
-    # Phase 1 (0 → phase1_end): approach — high proximity/distance, low success
-    # Phase 2 (phase1_end → phase2_end): land — ramp success, fade proximity
-    # Phase 3 (phase2_end →): efficient — full success, minimal proximity
-    reward_phase1_end = 400       # iterations
-    reward_phase2_end = 1200      # iterations
-    # Phase 1 multipliers (approach)
-    phase1_proximity_mult = 1.5   # boost proximity signal
-    phase1_success_mult = 0.1     # low success — don't need it yet
-    # Phase 2 multipliers (land)
-    phase2_proximity_mult = 0.5   # fade proximity
-    phase2_success_mult = 1.0     # full success
-    # Phase 3 multipliers (efficient)
-    phase3_proximity_mult = 0.2   # minimal proximity — you should be landing, not hovering
-    phase3_success_mult = 1.0     # full success
+    # Goal distance curriculum — start close, ramp to full difficulty
+    curriculum_start_min = 0.5
+    curriculum_start_max = 1.5
+    curriculum_end_min = 1.0
+    curriculum_end_max = 3.0
+    curriculum_ramp_steps = 60_000
 
     # Goal height
     goal_height_min = 0.3     # metres
@@ -162,7 +155,8 @@ class WaypointNavEnv(DirectRLEnv):
             k: torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
             for k in [
                 "distance_to_goal_xy", "distance_to_goal_z", "velocity_toward_goal",
-                "proximity", "uprightness", "lin_vel", "ang_vel", "alive", "success",
+                "proximity", "pinpoint", "uprightness", "lin_vel", "ang_vel",
+                "alive", "altitude_penalty", "success",
             ]
         }
 
@@ -256,22 +250,13 @@ class WaypointNavEnv(DirectRLEnv):
     # Reward curriculum — phase-dependent multipliers
     # ------------------------------------------------------------------
 
-    def _get_reward_phase(self) -> tuple[float, float, int]:
-        """Return (proximity_mult, success_mult, phase_num) based on current iteration."""
-        # Use common_step_counter / (num_envs * num_steps_per_env) as rough iteration proxy
-        steps_per_iter = self.num_envs * 24  # num_steps_per_env from PPO config
-        iteration = self.common_step_counter / max(steps_per_iter, 1)
-
-        if iteration < self.cfg.reward_phase1_end:
-            return self.cfg.phase1_proximity_mult, self.cfg.phase1_success_mult, 1
-        elif iteration < self.cfg.reward_phase2_end:
-            # Linear blend from phase1 to phase2
-            t = (iteration - self.cfg.reward_phase1_end) / (self.cfg.reward_phase2_end - self.cfg.reward_phase1_end)
-            prox = self.cfg.phase1_proximity_mult + t * (self.cfg.phase2_proximity_mult - self.cfg.phase1_proximity_mult)
-            succ = self.cfg.phase1_success_mult + t * (self.cfg.phase2_success_mult - self.cfg.phase1_success_mult)
-            return prox, succ, 2
-        else:
-            return self.cfg.phase3_proximity_mult, self.cfg.phase3_success_mult, 3
+    def _get_success_threshold(self) -> float:
+        """Linearly tighten the success threshold over training."""
+        progress = min(self.common_step_counter / self.cfg.success_threshold_ramp_steps, 1.0)
+        return (
+            self.cfg.success_threshold_start
+            + progress * (self.cfg.success_threshold_end - self.cfg.success_threshold_start)
+        )
 
     # ------------------------------------------------------------------
     # Physics step — identical action mapping to hover and lang_nav
@@ -340,27 +325,35 @@ class WaypointNavEnv(DirectRLEnv):
 
         # -- Success check (non-terminating — respawn waypoint instead) --
         dist = torch.linalg.norm(to_goal, dim=1)
-        success = dist < self.cfg.success_threshold
+        current_threshold = self._get_success_threshold()
+        success = dist < current_threshold
 
-        # -- Proximity bonus: sharp linear ramp inside radius, bridges tanh saturation --
+        # -- Proximity bonus: linear ramp inside 1.5m --
         inside_radius = (dist < self.cfg.proximity_radius).float()
         proximity = inside_radius * (1.0 - dist / self.cfg.proximity_radius)
 
-        # -- Reward curriculum: phase-dependent scaling --
-        prox_mult, succ_mult, phase = self._get_reward_phase()
+        # -- Pinpoint bonus: very steep ramp inside 0.5m — always pulls toward exact point --
+        inside_pinpoint = (dist < self.cfg.pinpoint_radius).float()
+        pinpoint = inside_pinpoint * (1.0 - dist / self.cfg.pinpoint_radius)
 
-        # -- Quality-gated success: full bonus only if arriving slow + stable --
+        # -- Quality-gated success --
         speed = torch.linalg.norm(self._robot.data.root_lin_vel_b, dim=1)
         ang_vel_mag = torch.linalg.norm(self._robot.data.root_ang_vel_b, dim=1)
         speed_quality = torch.clamp(1.0 - speed / 1.5, min=0.2, max=1.0)
         stability_quality = torch.clamp(1.0 - ang_vel_mag / 3.0, min=0.2, max=1.0)
-        arrival_quality = speed_quality * stability_quality  # 0.04 to 1.0
+        arrival_quality = speed_quality * stability_quality
+
+        # -- Altitude warning: soft penalty near ground/ceiling --
+        too_low = torch.clamp(self.cfg.altitude_warning_low - drone_pos[:, 2], min=0.0)
+        too_high = torch.clamp(drone_pos[:, 2] - self.cfg.altitude_warning_high, min=0.0)
+        altitude_penalty = (too_low + too_high) * self.cfg.crash_penalty_scale
 
         rewards = {
             "distance_to_goal_xy": xy_mapped * self.cfg.xy_reward_scale * self.step_dt,
             "distance_to_goal_z": z_mapped * self.cfg.z_reward_scale * self.step_dt,
             "velocity_toward_goal": vel_toward_clamp * self.cfg.velocity_toward_goal_scale * self.step_dt,
-            "proximity": proximity * self.cfg.proximity_scale * prox_mult * self.step_dt,
+            "proximity": proximity * self.cfg.proximity_scale * self.step_dt,
+            "pinpoint": pinpoint * self.cfg.pinpoint_scale * self.step_dt,
             "uprightness": uprightness * self.cfg.uprightness_reward_scale * self.step_dt,
             "lin_vel": (
                 torch.sum(torch.square(self._robot.data.root_lin_vel_b), dim=1)
@@ -373,8 +366,8 @@ class WaypointNavEnv(DirectRLEnv):
                 * self.step_dt
             ),
             "alive": torch.ones(self.num_envs, device=self.device) * self.cfg.alive_reward * self.step_dt,
-            # Distance bonus: 1.0 at dist=0, 0.0 at dist=threshold — closer = more reward
-            "success": success.float() * self.cfg.success_reward * succ_mult * arrival_quality * (1.0 - dist / self.cfg.success_threshold).clamp(min=0.0),
+            "altitude_penalty": altitude_penalty * self.step_dt,
+            "success": success.float() * self.cfg.success_reward * arrival_quality,
         }
 
         reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
@@ -485,10 +478,7 @@ class WaypointNavEnv(DirectRLEnv):
         extras["Curriculum/progress"] = progress
         extras["Curriculum/goal_dist_min"] = current_min
         extras["Curriculum/goal_dist_max"] = current_max
-        prox_mult, succ_mult, phase = self._get_reward_phase()
-        extras["Curriculum/reward_phase"] = phase
-        extras["Curriculum/proximity_mult"] = prox_mult
-        extras["Curriculum/success_mult"] = succ_mult
+        extras["Curriculum/success_threshold"] = self._get_success_threshold()
         extras["Metrics/waypoints_reached"] = torch.mean(self._waypoints_reached[env_ids])
         self._waypoints_reached[env_ids] = 0
 
