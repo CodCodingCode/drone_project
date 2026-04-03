@@ -214,15 +214,6 @@ class WaypointNavEnv(DirectRLEnv):
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
         self._terrain = self.cfg.terrain.class_type(self.cfg.terrain)
 
-        # Dark ground plane so drone and markers stand out
-        ground_cfg = sim_utils.MeshCuboidCfg(
-            size=(20.0, 20.0, 0.01),
-            visual_material=sim_utils.PreviewSurfaceCfg(
-                diffuse_color=(0.15, 0.15, 0.18),
-            ),
-        )
-        ground_cfg.func("/World/envs/env_.*/ground_visual", ground_cfg, translation=(0.0, 0.0, -0.005))
-
         # Colored corner markers for spatial reference (matches hover)
         for pos, color, name in [
             ((2.0, 0.0, 0.15), (0.8, 0.1, 0.1), "marker_red"),
@@ -241,8 +232,11 @@ class WaypointNavEnv(DirectRLEnv):
         if self.device == "cpu":
             self.scene.filter_collisions(global_prim_paths=[self.cfg.terrain.prim_path])
 
-        # Lighting — dome light for ambient + sun for shadows
-        light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
+        # Lighting — matches hover exactly
+        light_cfg = sim_utils.DomeLightCfg(
+            intensity=1500.0,
+            texture_file=f"{ISAAC_NUCLEUS_DIR}/Materials/Textures/Skies/PolyHaven/kloofendal_43d_clear_puresky_4k.hdr",
+        )
         light_cfg.func("/World/Light", light_cfg)
         dist_light = sim_utils.DistantLightCfg(intensity=800.0, color=(1.0, 0.95, 0.85))
         dist_light.func("/World/SunLight", dist_light)
