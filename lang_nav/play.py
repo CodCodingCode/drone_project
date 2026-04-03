@@ -54,8 +54,6 @@ simulation_app = app_launcher.app
 import gymnasium as gym
 import torch
 
-import isaaclab.sim as sim_utils
-from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from rsl_rl.runners import OnPolicyRunner
 
 from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper, handle_deprecated_rsl_rl_cfg
@@ -102,25 +100,6 @@ def main():
     else:
         env = gym.make("Isaac-LangDrone-Direct-v0", cfg=env_cfg)
 
-    # Grab reference to base env before wrapping
-    base_env = env.unwrapped
-
-    # Glowing sphere marker above the target object
-    marker_cfg = VisualizationMarkersCfg(
-        prim_path="/World/Visuals/target_marker",
-        markers={
-            "glow_sphere": sim_utils.SphereCfg(
-                radius=0.15,
-                visual_material=sim_utils.PreviewSurfaceCfg(
-                    diffuse_color=(1.0, 0.8, 0.0),
-                    emissive_color=(1.0, 0.8, 0.0),
-                    opacity=0.85,
-                ),
-            ),
-        },
-    )
-    target_marker = VisualizationMarkers(marker_cfg)
-
     # Wrap with RecordVideo then RSL-RL wrapper
     if args_cli.video:
         env = gym.wrappers.RecordVideo(
@@ -155,12 +134,6 @@ def main():
         for step in range(total_steps):
             actions = policy(obs)
             obs, _, _, _ = env.step(actions)
-
-            # Update glowing sphere above the current target object
-            target_idx = base_env._target_obj_idx[0].item()
-            marker_pos = base_env._obj_pos_w[0, target_idx].clone()
-            marker_pos[2] += 0.7  # float above the object
-            target_marker.visualize(translations=marker_pos.unsqueeze(0))
 
             if step % 100 == 0:
                 print(f"  Step {step}/{total_steps}")

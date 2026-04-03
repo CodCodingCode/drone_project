@@ -99,8 +99,8 @@ class WaypointNavEnvCfg(DirectRLEnvCfg):
     lin_vel_penalty_scale = -0.01      # reduced from -0.05 — stop fighting navigation
     ang_vel_penalty_scale = -0.01      # same as hover and lang_nav
     alive_reward = 0.5                 # raised from 0.2 — match hover
-    success_reward = 50.0              # quality-gated: full 50 only if arriving slow + stable
-    success_threshold = 0.9            # let the drone succeed and learn, tighten later
+    success_reward = 50.0              # quality-gated + distance-scaled
+    success_threshold = 0.6            # drone gets to 0.50m — give room to trigger + distance scaling pushes closer
     proximity_scale = 8.0              # sharp bonus within 1.5m — bridges tanh saturation gap
     proximity_radius = 1.5             # metres — proximity bonus kicks in inside this radius
 
@@ -373,7 +373,8 @@ class WaypointNavEnv(DirectRLEnv):
                 * self.step_dt
             ),
             "alive": torch.ones(self.num_envs, device=self.device) * self.cfg.alive_reward * self.step_dt,
-            "success": success.float() * self.cfg.success_reward * succ_mult * arrival_quality,
+            # Distance bonus: 1.0 at dist=0, 0.0 at dist=threshold — closer = more reward
+            "success": success.float() * self.cfg.success_reward * succ_mult * arrival_quality * (1.0 - dist / self.cfg.success_threshold).clamp(min=0.0),
         }
 
         reward = torch.sum(torch.stack(list(rewards.values())), dim=0)

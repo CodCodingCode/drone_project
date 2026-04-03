@@ -37,6 +37,7 @@ from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
+from isaaclab.markers import VisualizationMarkersCfg, VisualizationMarkers
 from isaaclab.utils.math import quat_apply, subtract_frame_transforms
 
 from isaaclab_assets import CRAZYFLIE_CFG  # isort: skip
@@ -215,6 +216,20 @@ class LangDroneEnv(DirectRLEnv):
             "/World/envs/env_.*/cylinder", cylinder_cfg, translation=_OBJ_OFFSETS[2]
         )
 
+        # Coloured corner markers for spatial reference (matches hover/waypoint)
+        for pos, color, name in [
+            ((2.0, 0.0, 0.15), (0.8, 0.1, 0.1), "marker_red"),
+            ((-2.0, 0.0, 0.15), (0.1, 0.1, 0.8), "marker_blue"),
+            ((0.0, 2.0, 0.15), (0.1, 0.8, 0.1), "marker_green"),
+            ((0.0, -2.0, 0.15), (0.8, 0.8, 0.1), "marker_yellow"),
+        ]:
+            m_cfg = sim_utils.CylinderCfg(
+                radius=0.08,
+                height=0.3,
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=color),
+            )
+            m_cfg.func(f"/World/envs/env_.*/{name}", m_cfg, translation=pos)
+
         # Clone environments, then register assets and sensors
         self.scene.clone_environments(copy_from_source=False)
         if self.device == "cpu":
@@ -224,10 +239,27 @@ class LangDroneEnv(DirectRLEnv):
         self.scene.sensors["tiled_camera"] = self._camera
 
         light_cfg = sim_utils.DomeLightCfg(
-            intensity=750.0,
+            intensity=1500.0,
             texture_file=f"{ISAAC_NUCLEUS_DIR}/Materials/Textures/Skies/PolyHaven/kloofendal_43d_clear_puresky_4k.hdr",
         )
         light_cfg.func("/World/Light", light_cfg)
+        dist_light = sim_utils.DistantLightCfg(intensity=800.0, color=(1.0, 0.95, 0.85))
+        dist_light.func("/World/SunLight", dist_light)
+
+        # Dynamic target marker — glowing sphere above the current target object
+        self._target_marker = VisualizationMarkers(VisualizationMarkersCfg(
+            prim_path="/World/Visuals/target_marker",
+            markers={
+                "target": sim_utils.SphereCfg(
+                    radius=0.15,
+                    visual_material=sim_utils.PreviewSurfaceCfg(
+                        diffuse_color=(1.0, 0.8, 0.0),
+                        emissive_color=(1.0, 0.8, 0.0),
+                        opacity=0.85,
+                    ),
+                ),
+            },
+        ))
 
     # ------------------------------------------------------------------
     # Vision encoding
@@ -275,6 +307,12 @@ class LangDroneEnv(DirectRLEnv):
     # ------------------------------------------------------------------
 
     def _get_observations(self) -> dict:
+        # Update target marker above the current target object
+        env_ids = torch.arange(self.num_envs, device=self.device)
+        marker_pos = self._obj_pos_w[env_ids, self._target_obj_idx].clone()
+        marker_pos[:, 2] += 0.7
+        self._target_marker.visualize(translations=marker_pos)
+
         obs = torch.cat(
             [
                 self._robot.data.root_lin_vel_b,        # (N, 3)
