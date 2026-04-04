@@ -24,6 +24,7 @@ Reward (two-phase: stability always active, navigation fades in):
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 
@@ -41,7 +42,6 @@ from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.markers import VisualizationMarkersCfg, VisualizationMarkers
 from isaaclab.utils.math import quat_apply, quat_mul, subtract_frame_transforms
-
 from isaaclab_assets import CRAZYFLIE_CFG  # isort: skip
 
 from .clip_grounder import CLIPGrounder
@@ -125,8 +125,8 @@ class LangDroneEnvCfg(DirectRLEnvCfg):
 
     # Reward scales — stability (always active)
     lin_vel_reward_scale = -0.02
-    ang_vel_reward_scale = -0.005
-    alive_reward = 1.5
+    ang_vel_reward_scale = -0.03       # 6x stronger — discourage spinning/circling
+    alive_reward = 0.5                 # reduced from 1.5 — was dominating navigation signal
     uprightness_reward_scale = 0.5
     altitude_warning_low = 0.3
     altitude_warning_high = 2.8
@@ -138,10 +138,24 @@ class LangDroneEnvCfg(DirectRLEnvCfg):
     proximity_scale = 8.0
     proximity_radius = 1.5
     success_reward = 10.0
-    wrong_object_penalty = -3.0
+    wrong_object_penalty = -5.0  # soft per-step penalty (no longer terminates)
+
+    # Dwell reward — massive incentive to hover at the target (not just fly past)
+    dwell_reward_scale = 20.0
+    dwell_radius = 0.5               # metres — zone around target
+
+    # Pinpoint bonus — steep gradient for precise final approach
+    pinpoint_scale = 15.0
+    pinpoint_radius = 0.5
 
     # Task parameters
     success_threshold = 0.35  # metres — drone must get this close to target
+
+    # Object position randomization — forces the drone to use vision
+    obj_spawn_radius_min = 1.0   # min distance from env origin (XY plane)
+    obj_spawn_radius_max = 2.5   # max distance from env origin
+    obj_spawn_height = 0.2       # fixed Z height for all objects
+    obj_min_separation = 0.8     # min distance between any two objects
 
     # Two-phase learning: stabilise hover first, then fade in navigation
     survival_only_steps = 3000
@@ -171,19 +185,28 @@ class LangDroneEnv(DirectRLEnv):
         # Camera body-frame offset (constant, used to position camera relative to drone)
         self._cam_offset = torch.tensor(self.cfg.camera_body_offset_pos, dtype=torch.float32, device=self.device)
 
-        # 90° pitch quaternion: rotates camera from looking down (-Z) to forward (+X)
-        # wxyz format: 90° rotation around -Y axis
-        import math
-        half = math.pi / 4.0  # half of 90°
+        # Camera rotation: -90° Y (look forward instead of down) + -10° X (slight nose-down FPV tilt)
+        # Equivalent to RotateXYZ(-10, -90, 0) from the main.py FPV camera fix
+        # Precomputed quaternion (wxyz) for the composed rotation:
+        hy = math.radians(-90) / 2.0
+        hx = math.radians(-10) / 2.0
+        # q = qx * qy (intrinsic: Y first, then X)
+        # qy = (cos(hy), 0, sin(hy), 0), qx = (cos(hx), sin(hx), 0, 0)
+        w = math.cos(hx) * math.cos(hy)
+        x = math.sin(hx) * math.cos(hy)
+        y = math.cos(hx) * math.sin(hy)
+        z = -math.sin(hx) * math.sin(hy)
         self._cam_pitch_quat = torch.tensor(
-            [math.cos(half), 0.0, -math.sin(half), 0.0],  # wxyz: 90° around -Y
-            dtype=torch.float32, device=self.device,
+            [w, x, y, z], dtype=torch.float32, device=self.device,
         )
 
         # World positions of all 3 objects for every env: (num_envs, 3, 3)
         # Kept for reward/done computation (ground truth, not in obs)
         offsets = torch.tensor(_OBJ_OFFSETS, dtype=torch.float32, device=self.device)
         self._obj_pos_w = self._terrain.env_origins.unsqueeze(1) + offsets.unsqueeze(0)
+
+        # Dwell tracking — consecutive steps inside dwell zone
+        self._dwell_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
         # Robot dynamics constants
         self._body_id = self._robot.find_bodies("body")[0]
@@ -197,6 +220,7 @@ class LangDroneEnv(DirectRLEnv):
             for k in [
                 "lin_vel", "ang_vel", "alive", "uprightness", "altitude_penalty",
                 "distance_to_goal", "velocity_toward_goal", "proximity",
+                "dwell", "pinpoint",
                 "success", "wrong_object",
             ]
         }
@@ -306,17 +330,32 @@ class LangDroneEnv(DirectRLEnv):
     # ------------------------------------------------------------------
 
     def _update_camera_pose(self):
-        """Move the standalone camera prim to follow the drone body each step.
+        """Move the camera to follow the drone, gimbal-stabilized (yaw only).
 
-        Isaac Sim cameras look down -Z by default. We apply a 90° pitch
-        so the camera looks along the drone's +X (forward) axis instead.
+        The camera follows the drone's position and heading (yaw) but ignores
+        roll and pitch tilt. This prevents the camera from pointing at the
+        ground when the drone tilts forward to fly.
         """
         drone_pos = self._robot.data.root_pos_w   # (N, 3)
         drone_quat = self._robot.data.root_quat_w  # (N, 4) wxyz
-        # Apply body-frame offset to get camera world position
-        cam_pos = drone_pos + quat_apply(drone_quat, self._cam_offset.expand(self.num_envs, -1))
-        # Compose drone orientation with a 90° pitch to look forward instead of down
-        cam_quat = quat_mul(drone_quat, self._cam_pitch_quat.expand(self.num_envs, -1))
+
+        # Extract yaw-only quaternion (ignore roll and pitch)
+        # For wxyz format: yaw = atan2(2*(w*z + x*y), 1 - 2*(y*y + z*z))
+        w, x, y, z = drone_quat[:, 0], drone_quat[:, 1], drone_quat[:, 2], drone_quat[:, 3]
+        yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+        half_yaw = yaw * 0.5
+        yaw_quat = torch.stack([
+            torch.cos(half_yaw),          # w
+            torch.zeros_like(half_yaw),   # x
+            torch.zeros_like(half_yaw),   # y
+            torch.sin(half_yaw),          # z
+        ], dim=-1)  # (N, 4) — level orientation with only yaw
+
+        # Position: follow drone but at a fixed height (no vertical bob from tilt)
+        cam_pos = drone_pos + quat_apply(yaw_quat, self._cam_offset.expand(self.num_envs, -1))
+
+        # Compose yaw-only orientation with pitch correction to look forward
+        cam_quat = quat_mul(yaw_quat, self._cam_pitch_quat.expand(self.num_envs, -1))
         self._camera._view.set_world_poses(cam_pos, cam_quat)
 
     def _maybe_encode_vision(self):
@@ -419,7 +458,19 @@ class LangDroneEnv(DirectRLEnv):
         ).min(dim=1).values
 
         success = dist_to_target < self.cfg.success_threshold
-        wrong_object = dist_to_wrong < self.cfg.success_threshold
+
+        # Dwell reward — massive bonus for hovering inside the target zone
+        inside_dwell = dist_to_target < self.cfg.dwell_radius
+        dwell = inside_dwell.float()
+        self._dwell_steps = torch.where(inside_dwell, self._dwell_steps + 1, torch.zeros_like(self._dwell_steps))
+
+        # Pinpoint bonus — steep ramp inside 0.5m for precise final approach
+        inside_pinpoint = (dist_to_target < self.cfg.pinpoint_radius).float()
+        pinpoint = inside_pinpoint * (1.0 - dist_to_target / self.cfg.pinpoint_radius)
+
+        # Wrong object: soft shaping penalty — stronger the closer you get
+        # (no termination, just discourages lingering near wrong objects)
+        wrong_proximity = torch.clamp(1.0 - dist_to_wrong / self.cfg.proximity_radius, min=0.0)
 
         # Two-phase: navigation rewards are zero during survival phase
         nav = self._get_nav_multiplier()
@@ -448,9 +499,11 @@ class LangDroneEnv(DirectRLEnv):
             "distance_to_goal": dist_mapped * self.cfg.distance_to_goal_reward_scale * self.step_dt,
             "velocity_toward_goal": vel_toward_clamp * self.cfg.velocity_toward_goal_scale * self.step_dt,
             "proximity": proximity * self.cfg.proximity_scale * self.step_dt,
-            # CLIP-dependent rewards — gated (these are NEW skills the VLA must learn)
+            # Precision rewards — gated (require finding the RIGHT target)
+            "dwell": dwell * self.cfg.dwell_reward_scale * nav * self.step_dt,
+            "pinpoint": pinpoint * self.cfg.pinpoint_scale * nav * self.step_dt,
             "success": success.float() * self.cfg.success_reward * nav,
-            "wrong_object": wrong_object.float() * self.cfg.wrong_object_penalty * nav,
+            "wrong_object": wrong_proximity * self.cfg.wrong_object_penalty * nav * self.step_dt,
         }
 
         reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
@@ -465,18 +518,11 @@ class LangDroneEnv(DirectRLEnv):
         target_pos = self._obj_pos_w[env_ids, self._target_obj_idx]
         dist_to_target = torch.linalg.norm(target_pos - drone_pos, dim=1)
 
-        wrong_mask = torch.ones(self.num_envs, 3, dtype=torch.bool, device=self.device)
-        wrong_mask[env_ids, self._target_obj_idx] = False
-        wrong_obj_pos = self._obj_pos_w[wrong_mask].reshape(self.num_envs, 2, 3)
-        dist_to_wrong = torch.linalg.norm(
-            wrong_obj_pos - drone_pos.unsqueeze(1), dim=-1
-        ).min(dim=1).values
-
         success = dist_to_target < self.cfg.success_threshold
-        wrong_object = dist_to_wrong < self.cfg.success_threshold
         fell = (drone_pos[:, 2] < 0.1) | (drone_pos[:, 2] > 3.0)
 
-        terminated = success | wrong_object | fell
+        # Only success and crash terminate — wrong object is a soft penalty now
+        terminated = success | fell
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         return terminated, time_out
 
@@ -510,6 +556,7 @@ class LangDroneEnv(DirectRLEnv):
             )
 
         self._actions[env_ids] = 0.0
+        self._dwell_steps[env_ids] = 0
 
         # Reset robot kinematics
         joint_pos = self._robot.data.default_joint_pos[env_ids]
@@ -519,6 +566,9 @@ class LangDroneEnv(DirectRLEnv):
         self._robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self._robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+
+        # Randomize object positions for reset envs
+        self._randomize_object_positions(env_ids)
 
         # Sample new language commands and encode with CLIP
         n = len(env_ids)
@@ -537,3 +587,49 @@ class LangDroneEnv(DirectRLEnv):
 
         # Force immediate vision encoding on next step for reset envs
         self._steps_since_encode[env_ids] = self.cfg.clip_encode_every_n
+
+    def _randomize_object_positions(self, env_ids: torch.Tensor):
+        """Randomize XY positions of all 3 objects for the given envs.
+
+        Objects are placed at random angles around the env origin with
+        distance sampled from [obj_spawn_radius_min, obj_spawn_radius_max].
+        Rejection sampling ensures minimum separation between objects.
+        """
+        n = len(env_ids)
+        cfg = self.cfg
+        origins = self._terrain.env_origins[env_ids]  # (n, 3)
+
+        for i in range(n):
+            eid = int(env_ids[i])
+            positions = []
+            for obj_idx in range(3):
+                for _attempt in range(50):  # rejection sampling
+                    angle = random.uniform(0, 2 * 3.14159265)
+                    radius = random.uniform(cfg.obj_spawn_radius_min, cfg.obj_spawn_radius_max)
+                    x = radius * math.cos(angle)
+                    y = radius * math.sin(angle)
+                    pos = torch.tensor([x, y, cfg.obj_spawn_height], device=self.device)
+                    # Check separation from already-placed objects
+                    ok = True
+                    for prev in positions:
+                        if torch.linalg.norm(pos[:2] - prev[:2]) < cfg.obj_min_separation:
+                            ok = False
+                            break
+                    if ok:
+                        positions.append(pos)
+                        break
+                else:
+                    # Fallback: use fixed offset if rejection sampling fails
+                    fallback = torch.tensor(_OBJ_OFFSETS[obj_idx], device=self.device)
+                    positions.append(fallback)
+
+            # Update world positions for reward/done computation
+            for obj_idx in range(3):
+                world_pos = origins[i] + positions[obj_idx]
+                self._obj_pos_w[eid, obj_idx] = world_pos
+
+                # Move the visual prim
+                self._obj_views[obj_idx].set_world_poses(
+                    positions=world_pos.unsqueeze(0),
+                    indices=torch.tensor([eid], dtype=torch.long, device=self.device),
+                )
