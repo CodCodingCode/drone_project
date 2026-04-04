@@ -80,7 +80,7 @@ class PaliGemmaFeatureExtractor(nn.Module):
 
         print(f"[VLA] Loading PaliGemma from {model_name}...")
         self.model = PaliGemmaForConditionalGeneration.from_pretrained(
-            model_name, torch_dtype=dtype,
+            model_name, torch_dtype=dtype, attn_implementation="eager",
         )
 
         # Freeze everything
@@ -89,10 +89,6 @@ class PaliGemmaFeatureExtractor(nn.Module):
 
         # Apply LoRA to targeted layers
         self._apply_lora(lora_rank, lora_alpha, lora_targets)
-
-        # Enable gradient checkpointing to save memory
-        if hasattr(self.model, "gradient_checkpointing_enable"):
-            self.model.gradient_checkpointing_enable()
 
         self._dtype = dtype
         self._img_size = 224
@@ -135,18 +131,19 @@ class PaliGemmaFeatureExtractor(nn.Module):
         x = (x - 0.5) / 0.5  # SigLIP uses [-1, 1] normalization
         return x.to(self._dtype)
 
+    @torch.no_grad()
     def forward(
         self,
         pixel_values: torch.Tensor,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Extract features from PaliGemma.
+        """Extract features from PaliGemma (always no_grad to avoid OOM).
 
         Returns:
-            (batch_size, 2048) float32 tensor — mean-pooled last hidden state.
+            (batch_size, 2048) float32 tensor — mean-pooled last hidden state, detached.
         """
-        with torch.cuda.amp.autocast(dtype=self._dtype):
+        with torch.amp.autocast("cuda", dtype=self._dtype):
             outputs = self.model.model(
                 input_ids=input_ids,
                 pixel_values=pixel_values,
@@ -155,24 +152,65 @@ class PaliGemmaFeatureExtractor(nn.Module):
                 return_dict=True,
             )
 
-        # Mean-pool over sequence length (mask-aware)
+        # Last token hidden state — captures full image+text context via causal attention
+        # (mean-pooling dilutes the text signal across 256 image tokens)
         hidden = outputs.last_hidden_state  # (B, seq_len, 2048)
-        mask = attention_mask.unsqueeze(-1).to(hidden.dtype)  # (B, seq_len, 1)
-        features = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
-        return features.float()  # back to fp32
+        # Find last non-padding token per batch element
+        seq_lengths = attention_mask.sum(dim=1) - 1  # (B,)
+        features = hidden[torch.arange(hidden.shape[0], device=hidden.device), seq_lengths]
+        return features.float()
 
     def get_features(self, rgb: torch.Tensor, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        """Cached feature extraction — avoids double forward for actor + critic."""
-        cache_key = id(rgb)
+        """Cached, mini-batched feature extraction (always detached)."""
+        cache_key = rgb.data_ptr()
         if self._cache_key == cache_key and self._cache_val is not None:
             return self._cache_val
 
         pixel_values = self.preprocess_images(rgb)
-        features = self.forward(pixel_values, input_ids, attention_mask)
+
+        batch_size = pixel_values.shape[0]
+        chunk_size = 64
+        if batch_size <= chunk_size:
+            features = self.forward(pixel_values, input_ids, attention_mask)
+        else:
+            chunks = []
+            for i in range(0, batch_size, chunk_size):
+                j = min(i + chunk_size, batch_size)
+                chunk_feat = self.forward(
+                    pixel_values[i:j], input_ids[i:j], attention_mask[i:j]
+                )
+                chunks.append(chunk_feat)
+            features = torch.cat(chunks, dim=0)
 
         self._cache_key = cache_key
-        self._cache_val = features
-        return features
+        self._cache_val = features.detach()
+        return self._cache_val
+
+    def forward_with_grad(
+        self,
+        pixel_values: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Extract features WITH gradient tracking for LoRA fine-tuning.
+
+        Same as forward() but allows backpropagation through LoRA adapters.
+        Only used during the LoRA update step on small mini-batches.
+        """
+        with torch.amp.autocast("cuda", dtype=self._dtype):
+            outputs = self.model.model(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                attention_mask=attention_mask,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+
+        # Last token hidden state — same as forward() but with gradients
+        hidden = outputs.last_hidden_state
+        seq_lengths = attention_mask.sum(dim=1) - 1
+        features = hidden[torch.arange(hidden.shape[0], device=hidden.device), seq_lengths]
+        return features.float()  # NOT detached — gradients flow through LoRA
 
     def clear_cache(self):
         self._cache_key = None
@@ -272,15 +310,18 @@ class VLAActorModel(nn.Module):
     def forward(self, obs: dict[str, torch.Tensor], masks=None, hidden_state=None, stochastic_output: bool = False) -> torch.Tensor:
         """Forward pass: extract features, fuse, produce actions."""
         flight_state = obs["policy"]          # (B, 9)
-        rgb = obs["rgb"]                      # (B, 64, 64, 3)
-        text_tokens = obs["text_tokens"]      # (B, 32)
-        text_mask = obs["text_mask"]          # (B, 32)
 
         # Normalize flight state
         flight_norm = self._normalize_flight_state(flight_state)
 
-        # PaliGemma features (cached for critic reuse)
-        vla_features = self.paligemma.get_features(rgb, text_tokens.long(), text_mask.long())  # (B, 2048)
+        # Use pre-computed features if available (from rollout buffer), else compute
+        if "vla_features" in obs and obs["vla_features"].any():
+            vla_features = obs["vla_features"]
+        else:
+            rgb = obs["rgb"]
+            text_tokens = obs["text_tokens"]
+            text_mask = obs["text_mask"]
+            vla_features = self.paligemma.get_features(rgb, text_tokens.long(), text_mask.long())
 
         # Fuse and run action head
         fused = torch.cat([vla_features, flight_norm], dim=-1)  # (B, 2057)
@@ -290,6 +331,30 @@ class VLAActorModel(nn.Module):
         if stochastic_output:
             dist = torch.distributions.Normal(self._action_mean, self._action_std)
             return dist.sample()
+        return self._action_mean
+
+    def forward_with_grad_features(self, obs: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Forward pass with gradient flow through PaliGemma LoRA.
+
+        Used ONLY during the LoRA fine-tuning step. Returns action means
+        with a computation graph that connects back through LoRA adapters.
+        """
+        flight_state = obs["policy"]
+        flight_norm = self._normalize_flight_state(flight_state)
+
+        rgb = obs["rgb"]
+        text_tokens = obs["text_tokens"]
+        text_mask = obs["text_mask"]
+
+        pixel_values = self.paligemma.preprocess_images(rgb)
+        vla_features = self.paligemma.forward_with_grad(
+            pixel_values, text_tokens.long(), text_mask.long()
+        )
+
+        fused = torch.cat([vla_features, flight_norm], dim=-1)
+        self._action_mean = self.mlp(fused)
+        self._action_std = self._std_param.exp().expand_as(self._action_mean)
+
         return self._action_mean
 
     @property
@@ -363,15 +428,17 @@ class VLACriticModel(nn.Module):
 
     def forward(self, obs: dict[str, torch.Tensor], masks=None, hidden_state=None, stochastic_output: bool = False) -> torch.Tensor:
         flight_state = obs["policy"]
-        rgb = obs["rgb"]
-        text_tokens = obs["text_tokens"]
-        text_mask = obs["text_mask"]
-
         flight_norm = self._normalize_flight_state(flight_state)
 
-        # Reuse cached PaliGemma features from actor's forward pass
-        assert self._shared_paligemma is not None, "Call critic._shared_paligemma = actor.paligemma first"
-        vla_features = self._shared_paligemma.get_features(rgb, text_tokens.long(), text_mask.long())
+        # Use pre-computed features if available (from rollout buffer), else compute
+        if "vla_features" in obs and obs["vla_features"].any():
+            vla_features = obs["vla_features"]
+        else:
+            rgb = obs["rgb"]
+            text_tokens = obs["text_tokens"]
+            text_mask = obs["text_mask"]
+            assert self._shared_paligemma is not None, "Call critic._shared_paligemma = actor.paligemma first"
+            vla_features = self._shared_paligemma.get_features(rgb, text_tokens.long(), text_mask.long())
 
         fused = torch.cat([vla_features, flight_norm], dim=-1)
         return self.mlp(fused)

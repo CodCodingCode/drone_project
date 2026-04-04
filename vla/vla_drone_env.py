@@ -43,8 +43,9 @@ from lang_nav.commands import COMMANDS, OBJECT_TYPES
 # Fixed object offsets (same as lang_nav)
 _OBJ_OFFSETS = [(-1.5, 0.0, 0.2), (1.5, 0.0, 0.2), (0.0, 1.5, 0.2)]
 
-# Max tokenized text length for PaliGemma
-_MAX_TEXT_LEN = 32
+# Max tokenized text length for PaliGemma (256 image tokens + text tokens + padding)
+_NUM_IMAGE_TOKENS = 256
+_MAX_TEXT_LEN = 280  # 256 image + ~20 text + margin
 
 
 @configclass
@@ -195,11 +196,12 @@ class VLADroneEnv(DirectRLEnv):
         self._metrics_file = open(self._metrics_path, "w")
         self._log_step = 0
 
-        # Load PaliGemma tokenizer (lightweight, no model weights)
-        from transformers import AutoTokenizer
-        print("[VLA Env] Loading PaliGemma tokenizer...")
-        self._tokenizer = AutoTokenizer.from_pretrained(self.cfg.tokenizer_name)
-        print("[VLA Env] Tokenizer loaded.")
+        # Load PaliGemma processor (tokenizer + image token handling)
+        from transformers import AutoProcessor
+        print("[VLA Env] Loading PaliGemma processor...")
+        self._processor = AutoProcessor.from_pretrained(self.cfg.tokenizer_name)
+        self._image_token_id = self._processor.tokenizer.convert_tokens_to_ids("<image>")
+        print(f"[VLA Env] Processor loaded. Image token id: {self._image_token_id}")
 
         # Initial reset
         self._reset_idx(None)
@@ -342,8 +344,9 @@ class VLADroneEnv(DirectRLEnv):
         return {
             "policy": flight_state,              # (N, 9)
             "rgb": self._cached_rgb,             # (N, 64, 64, 3) float [0,1]
-            "text_tokens": self._text_tokens,    # (N, 32) long
-            "text_mask": self._text_mask,        # (N, 32) long
+            "text_tokens": self._text_tokens,    # (N, 280) long
+            "text_mask": self._text_mask,        # (N, 280) long
+            "vla_features": torch.zeros(self.num_envs, 2048, dtype=torch.float32, device=self.device),  # placeholder, filled by train loop
         }
 
     # ------------------------------------------------------------------
@@ -480,17 +483,26 @@ class VLADroneEnv(DirectRLEnv):
             for i in obj_type_indices
         ]
 
-        # Tokenize with PaliGemma tokenizer
-        tokenized = self._tokenizer(
-            commands,
+        # Tokenize with PaliGemma processor (prepends 256 image placeholder tokens)
+        # Add <image> prefix so PaliGemma knows where to inject visual features
+        prefixed_commands = ["\n" + cmd for cmd in commands]
+        tokenized = self._processor.tokenizer(
+            prefixed_commands,
             return_tensors="pt",
             padding="max_length",
             truncation=True,
-            max_length=self.cfg.max_text_length,
+            max_length=self.cfg.max_text_length - _NUM_IMAGE_TOKENS,
         )
+        # Prepend 256 image tokens to input_ids and attention_mask
+        batch_size = len(commands)
+        img_tokens = torch.full((batch_size, _NUM_IMAGE_TOKENS), self._image_token_id, dtype=torch.long)
+        img_mask = torch.ones(batch_size, _NUM_IMAGE_TOKENS, dtype=torch.long)
 
-        self._text_tokens[env_ids] = tokenized["input_ids"].to(self.device)
-        self._text_mask[env_ids] = tokenized["attention_mask"].to(self.device)
+        full_ids = torch.cat([img_tokens, tokenized["input_ids"]], dim=1)
+        full_mask = torch.cat([img_mask, tokenized["attention_mask"]], dim=1)
+
+        self._text_tokens[env_ids] = full_ids.to(self.device)
+        self._text_mask[env_ids] = full_mask.to(self.device)
         self._target_obj_idx[env_ids] = obj_type_indices.to(self.device)
         for i, eid in enumerate(env_ids):
             self._current_commands[int(eid)] = commands[i]

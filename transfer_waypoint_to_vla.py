@@ -23,29 +23,35 @@ import os
 import torch
 
 WAYPOINT_OBS_DIM = 15
-VLA_OBS_DIM = 1033
+VLA_OBS_DIM = 2057  # PaliGemma 2048 + flight state 9
 HIDDEN_DIM = 256
 SHARED_OBS_DIMS = 9  # lin_vel(3) + ang_vel(3) + projected_gravity(3)
 
 
 def _expand_input_weight(param, new_cols, shared_cols):
-    """Expand input weight matrix from (256, 15) to (256, 1033).
+    """Expand input weight matrix from (256, 15) to (256, 2057).
 
-    First 9 columns are copied (flight state). CLIP columns are
-    zero-initialized so the first hidden layer initially ignores them,
-    preserving the pretrained hover/nav behaviour on day one.
+    The VLA model concatenates as [paligemma_2048 | flight_state_9],
+    so flight state columns go at the END (cols 2048:2057), not the start.
+    PaliGemma feature columns (0:2048) are zero-initialized so the first
+    hidden layer initially ignores them, preserving pretrained hover/nav.
     """
     rows = param.shape[0]
+    paligemma_dim = new_cols - shared_cols  # 2048
     new = torch.zeros(rows, new_cols)
-    # Copy shared flight state columns
-    new[:, :shared_cols] = param[:, :shared_cols]
+    # Copy shared flight state columns to the END (after PaliGemma features)
+    new[:, paligemma_dim:paligemma_dim + shared_cols] = param[:, :shared_cols]
     return new
 
 
 def _expand_obs_normalizer(param, new_dim, shared_dims, fill_value):
-    """Expand obs normalizer stat from (1, 15) to (1, 1033)."""
+    """Expand obs normalizer stat from (1, 15) to (1, 2057).
+
+    Flight state dims go at the END to match [paligemma | flight_state] layout.
+    """
+    paligemma_dim = new_dim - shared_dims  # 2048
     new = torch.full((1, new_dim), fill_value)
-    new[:, :shared_dims] = param[:, :shared_dims]
+    new[:, paligemma_dim:paligemma_dim + shared_dims] = param[:, :shared_dims]
     return new
 
 

@@ -198,7 +198,7 @@ def run_scene():
     xform = UsdGeom.Xformable(fpv_cam_prim)
     xform.ClearXformOpOrder()
     xform.AddTranslateOp().Set(Gf.Vec3d(0.15, 0.0, 0.05))   # front of drone, slightly above
-    xform.AddRotateXYZOp().Set(Gf.Vec3f(-10.0, 0.0, 0.0))   # slight nose-down tilt
+    xform.AddRotateXYZOp().Set(Gf.Vec3f(-10.0, -90.0, 0.0))  # face forward along +X, 10° nose-down tilt
 
     fpv_output_dir = "/tmp/drone_fpv"
     os.makedirs(fpv_output_dir, exist_ok=True)
