@@ -40,7 +40,7 @@ from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.markers import VisualizationMarkersCfg, VisualizationMarkers
-from isaaclab.utils.math import quat_apply, subtract_frame_transforms
+from isaaclab.utils.math import quat_apply, quat_mul, subtract_frame_transforms
 
 from isaaclab_assets import CRAZYFLIE_CFG  # isort: skip
 
@@ -171,6 +171,15 @@ class LangDroneEnv(DirectRLEnv):
         # Camera body-frame offset (constant, used to position camera relative to drone)
         self._cam_offset = torch.tensor(self.cfg.camera_body_offset_pos, dtype=torch.float32, device=self.device)
 
+        # 90° pitch quaternion: rotates camera from looking down (-Z) to forward (+X)
+        # wxyz format: 90° rotation around -Y axis
+        import math
+        half = math.pi / 4.0  # half of 90°
+        self._cam_pitch_quat = torch.tensor(
+            [math.cos(half), 0.0, -math.sin(half), 0.0],  # wxyz: 90° around -Y
+            dtype=torch.float32, device=self.device,
+        )
+
         # World positions of all 3 objects for every env: (num_envs, 3, 3)
         # Kept for reward/done computation (ground truth, not in obs)
         offsets = torch.tensor(_OBJ_OFFSETS, dtype=torch.float32, device=self.device)
@@ -297,13 +306,18 @@ class LangDroneEnv(DirectRLEnv):
     # ------------------------------------------------------------------
 
     def _update_camera_pose(self):
-        """Move the standalone camera prim to follow the drone body each step."""
+        """Move the standalone camera prim to follow the drone body each step.
+
+        Isaac Sim cameras look down -Z by default. We apply a 90° pitch
+        so the camera looks along the drone's +X (forward) axis instead.
+        """
         drone_pos = self._robot.data.root_pos_w   # (N, 3)
         drone_quat = self._robot.data.root_quat_w  # (N, 4) wxyz
         # Apply body-frame offset to get camera world position
         cam_pos = drone_pos + quat_apply(drone_quat, self._cam_offset.expand(self.num_envs, -1))
-        # Camera inherits drone orientation (forward-facing)
-        self._camera._view.set_world_poses(cam_pos, drone_quat)
+        # Compose drone orientation with a 90° pitch to look forward instead of down
+        cam_quat = quat_mul(drone_quat, self._cam_pitch_quat.expand(self.num_envs, -1))
+        self._camera._view.set_world_poses(cam_pos, cam_quat)
 
     def _maybe_encode_vision(self):
         """Encode onboard camera images with CLIP every N steps."""
