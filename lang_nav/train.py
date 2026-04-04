@@ -105,9 +105,24 @@ def main():
     if args_cli.resume_path:
         print(f"[INFO] Loading pretrained checkpoint: {args_cli.resume_path}")
         ckpt = torch.load(args_cli.resume_path, map_location=agent_cfg.device, weights_only=False)
-        runner.alg.actor.load_state_dict(ckpt["actor_state_dict"], strict=False)
-        runner.alg.critic.load_state_dict(ckpt["critic_state_dict"], strict=False)
-        print("[INFO] Pretrained weights loaded (strict=False — missing/extra keys ignored)")
+
+        # Filter out keys with shape mismatches (e.g. MLP checkpoint → GRU model)
+        for name, target_model in [("actor", runner.alg.actor), ("critic", runner.alg.critic)]:
+            src = ckpt[f"{name}_state_dict"]
+            model_state = target_model.state_dict()
+            compatible = {}
+            skipped = []
+            for k, v in src.items():
+                if k in model_state and model_state[k].shape == v.shape:
+                    compatible[k] = v
+                else:
+                    skipped.append(k)
+            target_model.load_state_dict(compatible, strict=False)
+            if skipped:
+                print(f"[INFO]   {name}: skipped {len(skipped)} mismatched keys: {skipped}")
+            print(f"[INFO]   {name}: loaded {len(compatible)}/{len(src)} keys")
+
+        print("[INFO] Pretrained weights loaded (shape-compatible keys only)")
 
     runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
 

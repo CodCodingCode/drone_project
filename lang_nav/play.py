@@ -165,7 +165,7 @@ def main():
     env_cfg.viewer.lookat = (0.0, 0.0, 0.0)
     env_cfg.viewer.resolution = (1920, 1080)
 
-    video_dir = os.path.join(_DRONE_PROJECT, "videos")
+    video_dir = os.path.join(_DRONE_PROJECT, "videos", "lang_nav")
     os.makedirs(video_dir, exist_ok=True)
 
     # Clean up old lang nav playback videos
