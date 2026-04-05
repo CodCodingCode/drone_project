@@ -29,7 +29,7 @@ from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
-from isaaclab.utils.math import quat_apply
+from isaaclab.utils.math import quat_apply, subtract_frame_transforms
 
 from isaaclab_assets import CRAZYFLIE_CFG  # isort: skip
 
@@ -97,7 +97,7 @@ class VLADroneEnvCfg(DirectRLEnvCfg):
     # Onboard camera (64x64 RGB)
     tiled_camera: TiledCameraCfg = TiledCameraCfg(
         prim_path="/World/envs/env_.*/Camera",
-        offset=TiledCameraCfg.OffsetCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0), convention="world"),
+        offset=TiledCameraCfg.OffsetCfg(pos=(0.0, 0.0, 0.0), rot=(0.5, -0.5, 0.5, -0.5), convention="world"),
         data_types=["rgb"],
         spawn=sim_utils.PinholeCameraCfg(
             focal_length=16.0,
@@ -120,8 +120,8 @@ class VLADroneEnvCfg(DirectRLEnvCfg):
     # Reward scales — stability (always active)
     lin_vel_reward_scale = -0.02
     ang_vel_reward_scale = -0.005
-    alive_reward = 1.5
-    uprightness_reward_scale = 0.5
+    alive_reward = 0.3  # minimal — waypoint policy handles flight, no need to bribe survival
+    uprightness_reward_scale = 0.2
     altitude_warning_low = 0.3
     altitude_warning_high = 2.8
     crash_penalty_scale = -10.0
@@ -132,13 +132,23 @@ class VLADroneEnvCfg(DirectRLEnvCfg):
     proximity_scale = 8.0
     proximity_radius = 1.5
     success_reward = 10.0
+    hover_at_target_reward = 20.0  # sustained reward for holding position near target (~0.4/step, 13x alive)
+    hover_at_target_radius = 0.6  # radius for hover reward
     wrong_object_penalty = -3.0
 
     success_threshold = 0.35
 
-    # Two-phase learning
-    survival_only_steps = 3000
-    nav_fadein_steps = 10000
+    # No curriculum needed — waypoint policy handles flight from iter 0
+    survival_only_steps = 0
+    nav_fadein_steps = 1  # instant full-scale navigation rewards
+    alive_fadeout_steps = 1  # alive is minimal from the start
+    alive_min_scale = 0.2
+
+    # Precision curriculum disabled — aux loss provides direct supervised signal
+    precision_curriculum_start = 999999999  # effectively off
+    precision_curriculum_steps = 1
+    hover_radius_start = 0.6
+    hover_radius_end = 0.6
 
 
 class VLADroneEnv(DirectRLEnv):
@@ -167,9 +177,8 @@ class VLADroneEnv(DirectRLEnv):
         # Camera body-frame offset
         self._cam_offset = torch.tensor(self.cfg.camera_body_offset_pos, dtype=torch.float32, device=self.device)
 
-        # World positions of all 3 objects: (num_envs, 3, 3)
-        offsets = torch.tensor(_OBJ_OFFSETS, dtype=torch.float32, device=self.device)
-        self._obj_pos_w = self._terrain.env_origins.unsqueeze(1) + offsets.unsqueeze(0)
+        # World positions of all 3 objects: (num_envs, 3, 3) — randomized at each reset
+        self._obj_pos_w = torch.zeros(self.num_envs, 3, 3, dtype=torch.float32, device=self.device)
 
         # Robot dynamics
         self._body_id = self._robot.find_bodies("body")[0]
@@ -183,7 +192,7 @@ class VLADroneEnv(DirectRLEnv):
             for k in [
                 "lin_vel", "ang_vel", "alive", "uprightness", "altitude_penalty",
                 "distance_to_goal", "velocity_toward_goal", "proximity",
-                "success", "wrong_object",
+                "hover_at_target", "success", "wrong_object",
             ]
         }
 
@@ -237,20 +246,13 @@ class VLADroneEnv(DirectRLEnv):
         )
         cylinder_cfg.func("/World/envs/env_.*/cylinder", cylinder_cfg, translation=_OBJ_OFFSETS[2])
 
-        # Corner markers
-        for pos, color, name in [
-            ((2.0, 0.0, 0.15), (0.8, 0.1, 0.1), "marker_red"),
-            ((-2.0, 0.0, 0.15), (0.1, 0.1, 0.8), "marker_blue"),
-            ((0.0, 2.0, 0.15), (0.1, 0.8, 0.1), "marker_green"),
-            ((0.0, -2.0, 0.15), (0.8, 0.8, 0.1), "marker_yellow"),
-        ]:
-            m_cfg = sim_utils.CylinderCfg(
-                radius=0.08, height=0.3,
-                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=color),
-            )
-            m_cfg.func(f"/World/envs/env_.*/{name}", m_cfg, translation=pos)
-
         self.scene.clone_environments(copy_from_source=False)
+
+        # Create XformPrimViews for repositioning objects at reset
+        from isaaclab.sim.views import XformPrimView
+        self._cube_view = XformPrimView("/World/envs/env_.*/cube", device=self.device)
+        self._sphere_view = XformPrimView("/World/envs/env_.*/sphere", device=self.device)
+        self._cylinder_view = XformPrimView("/World/envs/env_.*/cylinder", device=self.device)
         if self.device == "cpu":
             self.scene.filter_collisions(global_prim_paths=[self.cfg.terrain.prim_path])
 
@@ -306,6 +308,25 @@ class VLADroneEnv(DirectRLEnv):
             return 0.0
         return min((steps - self.cfg.survival_only_steps) / self.cfg.nav_fadein_steps, 1.0)
 
+    def _get_alive_scale(self) -> float:
+        """Alive reward fades from 1.0 to alive_min_scale over training."""
+        steps = self.common_step_counter
+        fade = min(steps / self.cfg.alive_fadeout_steps, 1.0)
+        return 1.0 - fade * (1.0 - self.cfg.alive_min_scale)
+
+    def _get_precision_scale(self) -> float:
+        """Curriculum: interpolates 0 → 1 over precision_curriculum_steps.
+
+        At 0: loose targeting (full distance/proximity rewards, wide hover radius)
+        At 1: precise targeting (shrunken rewards for approach, wide hover bonus for stopping)
+        """
+        steps = self.common_step_counter
+        start = self.cfg.precision_curriculum_start
+        length = self.cfg.precision_curriculum_steps
+        if steps < start:
+            return 0.0
+        return min((steps - start) / length, 1.0)
+
     # ------------------------------------------------------------------
     # Physics step
     # ------------------------------------------------------------------
@@ -331,7 +352,8 @@ class VLADroneEnv(DirectRLEnv):
     def _get_observations(self) -> dict:
         # Update target marker
         env_ids = torch.arange(self.num_envs, device=self.device)
-        marker_pos = self._obj_pos_w[env_ids, self._target_obj_idx].clone()
+        target_pos_w = self._obj_pos_w[env_ids, self._target_obj_idx]  # (N, 3)
+        marker_pos = target_pos_w.clone()
         marker_pos[:, 2] += 0.7
         self._target_marker.visualize(translations=marker_pos)
 
@@ -341,12 +363,19 @@ class VLADroneEnv(DirectRLEnv):
             self._robot.data.projected_gravity_b,   # (N, 3)
         ], dim=-1)  # (N, 9)
 
+        # Ground-truth target in body frame (for auxiliary supervision during training only)
+        target_gt_body, _ = subtract_frame_transforms(
+            self._robot.data.root_pos_w,
+            self._robot.data.root_quat_w,
+            target_pos_w,
+        )  # (N, 3)
+
         return {
             "policy": flight_state,              # (N, 9)
             "rgb": self._cached_rgb,             # (N, 64, 64, 3) float [0,1]
             "text_tokens": self._text_tokens,    # (N, 280) long
             "text_mask": self._text_mask,        # (N, 280) long
-            "vla_features": torch.zeros(self.num_envs, 2048, dtype=torch.float32, device=self.device),  # placeholder, filled by train loop
+            "target_gt_body": target_gt_body,    # (N, 3) — privileged GT for aux loss
         }
 
     # ------------------------------------------------------------------
@@ -364,10 +393,18 @@ class VLADroneEnv(DirectRLEnv):
 
         to_goal_dir = to_goal / dist_to_target.unsqueeze(1).clamp(min=0.01)
         vel_toward = torch.sum(self._robot.data.root_lin_vel_w * to_goal_dir, dim=1)
-        vel_toward_clamp = torch.clamp(vel_toward, 0.0, 2.0)
+        # Only reward velocity toward goal when far away (>1.0m), not when close (prevents circling)
+        far_from_target = (dist_to_target > 1.0).float()
+        vel_toward_clamp = torch.clamp(vel_toward, 0.0, 2.0) * far_from_target
 
         inside_radius = (dist_to_target < self.cfg.proximity_radius).float()
         proximity = inside_radius * (1.0 - dist_to_target / self.cfg.proximity_radius)
+
+        # Hover reward with curriculum: radius shrinks from 0.6 → 0.3 over training
+        precision = self._get_precision_scale()  # 0.0 → 1.0
+        hover_radius = self.cfg.hover_radius_start + precision * (self.cfg.hover_radius_end - self.cfg.hover_radius_start)
+        near_target = (dist_to_target < hover_radius).float()
+        hover_at_target = near_target
 
         uprightness = -self._robot.data.projected_gravity_b[:, 2]
 
@@ -386,18 +423,26 @@ class VLADroneEnv(DirectRLEnv):
         wrong_object = dist_to_wrong < self.cfg.success_threshold
 
         nav = self._get_nav_multiplier()
+        alive_scale = self._get_alive_scale()
+
+        # Precision curriculum: loose rewards fade, precise rewards amplify
+        # loose_scale: 1.0 → 0.2 (distance, proximity, velocity_toward_goal shrink)
+        # precise_scale: 1.0 → 3.0 (hover, success grow)
+        loose_scale = 1.0 - 0.8 * precision
+        precise_scale = 1.0 + 2.0 * precision
 
         rewards = {
             "lin_vel": torch.sum(torch.square(self._robot.data.root_lin_vel_b), dim=1) * self.cfg.lin_vel_reward_scale * self.step_dt,
             "ang_vel": torch.sum(torch.square(self._robot.data.root_ang_vel_b), dim=1) * self.cfg.ang_vel_reward_scale * self.step_dt,
-            "alive": torch.ones(self.num_envs, device=self.device) * self.cfg.alive_reward * self.step_dt,
+            "alive": torch.ones(self.num_envs, device=self.device) * self.cfg.alive_reward * alive_scale * self.step_dt,
             "uprightness": uprightness * self.cfg.uprightness_reward_scale * self.step_dt,
             "altitude_penalty": altitude_penalty * self.step_dt,
-            "distance_to_goal": dist_mapped * self.cfg.distance_to_goal_reward_scale * self.step_dt,
-            "velocity_toward_goal": vel_toward_clamp * self.cfg.velocity_toward_goal_scale * self.step_dt,
-            "proximity": proximity * self.cfg.proximity_scale * self.step_dt,
-            "success": success.float() * self.cfg.success_reward * nav,
-            "wrong_object": wrong_object.float() * self.cfg.wrong_object_penalty * nav,
+            "distance_to_goal": dist_mapped * self.cfg.distance_to_goal_reward_scale * self.step_dt * nav * loose_scale,
+            "velocity_toward_goal": vel_toward_clamp * self.cfg.velocity_toward_goal_scale * self.step_dt * nav * loose_scale,
+            "proximity": proximity * self.cfg.proximity_scale * self.step_dt * nav * loose_scale,
+            "hover_at_target": hover_at_target * self.cfg.hover_at_target_reward * self.step_dt * nav * precise_scale,
+            "success": success.float() * self.cfg.success_reward * nav * precise_scale,
+            "wrong_object": wrong_object.float() * self.cfg.wrong_object_penalty * nav * precise_scale,
         }
 
         reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
@@ -473,6 +518,44 @@ class VLADroneEnv(DirectRLEnv):
         self._robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self._robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+
+        # Randomize object positions within the arena
+        n = len(env_ids)
+        env_origins = self._terrain.env_origins[env_ids]  # (n, 3)
+        min_sep = 0.8  # minimum separation between objects
+
+        obj_positions = []  # 3 tensors of (n, 3)
+        for obj_idx in range(3):
+            for _ in range(100):  # rejection sampling with max attempts
+                xy = (torch.rand(n, 2, device=self.device) - 0.5) * 3.5  # [-1.75, 1.75]
+                pos = torch.cat([xy, torch.full((n, 1), 0.2, device=self.device)], dim=-1)
+                if obj_idx == 0:
+                    break
+                # Check min distance to all previously placed objects
+                ok = torch.ones(n, dtype=torch.bool, device=self.device)
+                for prev in obj_positions:
+                    dist = torch.linalg.norm(pos[:, :2] - prev[:, :2], dim=1)
+                    ok &= dist > min_sep
+                if ok.all():
+                    break
+                # For envs that failed, resample only those
+                pos[~ok] = obj_positions[0][~ok]  # fallback to avoid infinite loop
+            obj_positions.append(pos)
+
+        # World positions = env_origin + local offset
+        cube_world = env_origins + obj_positions[0]
+        sphere_world = env_origins + obj_positions[1]
+        cylinder_world = env_origins + obj_positions[2]
+
+        # Reposition the visual prims
+        self._cube_view.set_world_poses(positions=cube_world, indices=env_ids)
+        self._sphere_view.set_world_poses(positions=sphere_world, indices=env_ids)
+        self._cylinder_view.set_world_poses(positions=cylinder_world, indices=env_ids)
+
+        # Update cached positions for reward computation
+        self._obj_pos_w[env_ids, 0] = cube_world
+        self._obj_pos_w[env_ids, 1] = sphere_world
+        self._obj_pos_w[env_ids, 2] = cylinder_world
 
         # Sample new commands and tokenize for PaliGemma
         n = len(env_ids)

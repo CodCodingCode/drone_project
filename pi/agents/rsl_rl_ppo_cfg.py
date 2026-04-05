@@ -3,13 +3,13 @@ from isaaclab_rl.rsl_rl import RslRlPpoActorCriticCfg, RslRlOnPolicyRunnerCfg, R
 
 
 @configclass
-class VLADronePPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    num_steps_per_env = 8  # reduced for faster iterations with PaliGemma 3B
+class Pi0DronePPORunnerCfg(RslRlOnPolicyRunnerCfg):
+    num_steps_per_env = 8
     max_iterations = 5000
     save_interval = 100
-    experiment_name = "vla_drone_direct"
+    experiment_name = "pi0_drone_direct"
     logger = "wandb"
-    wandb_project = "drone-vla"
+    wandb_project = "drone-pi0"
 
     # NOTE: actor and critic are custom nn.Modules, not standard RslRl models.
     # They are constructed manually in train.py, not via construct_algorithm.
@@ -23,12 +23,7 @@ class VLADronePPORunnerCfg(RslRlOnPolicyRunnerCfg):
         critic_obs_normalization=True,
     )
 
-    # LoRA fine-tuning
-    lora_learning_rate: float = 1.0e-6
-    lora_mini_batch_size: int = 4
-    lora_max_grad_norm: float = 0.5
-    lora_update_every_n: int = 1
-    lora_warmup_iterations: int = 50
+    # No LoRA fields -- backbone is fully frozen
 
     algorithm = RslRlPpoAlgorithmCfg(
         value_loss_coef=1.0,
@@ -37,7 +32,7 @@ class VLADronePPORunnerCfg(RslRlOnPolicyRunnerCfg):
         entropy_coef=0.005,
         num_learning_epochs=5,
         num_mini_batches=4,
-        learning_rate=3.0e-5,
+        learning_rate=3.0e-4,   # Higher than VLA (1e-5) since only MLP params
         schedule="adaptive",
         gamma=0.99,
         lam=0.95,

@@ -1,8 +1,8 @@
-"""Play back a trained VLA policy and record video with text overlay + drone POV.
+"""Play back a trained Pi0 policy and record video with text overlay + drone POV.
 
 Launch:
     cd /home/ubuntu/IsaacLab
-    ./isaaclab.sh -p /home/ubuntu/drone_project/vla/play.py \
+    ./isaaclab.sh -p /home/ubuntu/drone_project/pi/play.py \
         --checkpoint <path/to/model.pt> --enable_cameras
 """
 
@@ -19,7 +19,7 @@ from isaaclab.app import AppLauncher
 
 _DRONE_PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-parser = argparse.ArgumentParser(description="Play trained VLA policy.")
+parser = argparse.ArgumentParser(description="Play trained Pi0 policy.")
 parser.add_argument("--checkpoint", type=str, required=True)
 parser.add_argument("--num_envs", type=int, default=1)
 parser.add_argument("--num_steps", type=int, default=750)
@@ -44,10 +44,10 @@ from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 if _DRONE_PROJECT not in sys.path:
     sys.path.insert(0, _DRONE_PROJECT)
 
-import vla  # noqa: F401
+import pi  # noqa: F401
 
 from vla.vla_drone_env import VLADroneEnvCfg
-from vla.vla_policy import VLAActorModel, HierarchicalVLAActor
+from pi.pi0_policy import Pi0ActorModel
 
 
 def add_text_overlay(frame: np.ndarray, command: str, step: int) -> np.ndarray:
@@ -95,23 +95,19 @@ def main():
     video_dir = os.path.join(_DRONE_PROJECT, "videos")
     os.makedirs(video_dir, exist_ok=True)
 
-    for old in glob.glob(os.path.join(video_dir, "vla_playback*")):
+    for old in glob.glob(os.path.join(video_dir, "pi0_playback*")):
         os.remove(old)
 
-    env = gym.make("Isaac-VLADrone-Direct-v0", cfg=env_cfg, render_mode="rgb_array")
+    env = gym.make("Isaac-Pi0Drone-Direct-v0", cfg=env_cfg, render_mode="rgb_array")
     env_unwrapped = env.unwrapped
     env = RslRlVecEnvWrapper(env)
 
     device = env_cfg.sim.device
 
-    # Construct hierarchical actor and load weights
-    print("[INFO] Loading Hierarchical VLA actor (PaliGemma + frozen waypoint policy)...")
-    waypoint_ckpt = os.path.join(_DRONE_PROJECT, "model_2998_waypoint.pt")
-    actor = HierarchicalVLAActor(
-        waypoint_checkpoint_path=waypoint_ckpt,
-        paligemma_model_name="google/paligemma-3b-pt-224",
-        init_std=0.3,
-        target_range=1.5,
+    # Construct actor and load weights
+    print("[INFO] Loading Pi0 actor...")
+    actor = Pi0ActorModel(
+        flight_state_dim=9, action_dim=4, hidden_dims=[256, 256],
     ).to(device)
 
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -124,7 +120,7 @@ def main():
     actor.eval()
 
     # Setup video writer
-    video_path = os.path.join(video_dir, "vla_playback.mp4")
+    video_path = os.path.join(video_dir, "pi0_playback.mp4")
     fps = 30
     writer = None
 
@@ -140,7 +136,7 @@ def main():
             actions = actor(obs_dict, stochastic_output=False)
             obs, _, dones, extras = env.step(actions)
             obs = obs.to(device)
-            actor.paligemma.clear_cache()
+            actor.pi0.clear_cache()
 
             # Record after warmup
             if step >= warmup_steps:

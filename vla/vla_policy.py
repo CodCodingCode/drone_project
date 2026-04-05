@@ -186,6 +186,57 @@ class PaliGemmaFeatureExtractor(nn.Module):
         self._cache_val = features.detach()
         return self._cache_val
 
+    @torch.no_grad()
+    def forward_tokens(
+        self,
+        pixel_values: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return full token-level hidden states (not pooled).
+
+        Returns:
+            (B, seq_len, 2048) float32 tensor — full sequence, detached.
+        """
+        with torch.amp.autocast("cuda", dtype=self._dtype):
+            outputs = self.model.model(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                attention_mask=attention_mask,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+        return outputs.last_hidden_state.float()  # (B, seq_len, 2048)
+
+    def get_token_features(self, rgb: torch.Tensor, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        """Cached, mini-batched token-level feature extraction.
+
+        Returns token sequence (B, seq_len, 2048) for attention-based heads.
+        """
+        cache_key = ("tokens", rgb.data_ptr())
+        if self._cache_key == cache_key and self._cache_val is not None:
+            return self._cache_val
+
+        pixel_values = self.preprocess_images(rgb)
+
+        batch_size = pixel_values.shape[0]
+        chunk_size = 32  # smaller chunks since we're keeping full sequence (more memory)
+        if batch_size <= chunk_size:
+            features = self.forward_tokens(pixel_values, input_ids, attention_mask)
+        else:
+            chunks = []
+            for i in range(0, batch_size, chunk_size):
+                j = min(i + chunk_size, batch_size)
+                chunk_feat = self.forward_tokens(
+                    pixel_values[i:j], input_ids[i:j], attention_mask[i:j]
+                )
+                chunks.append(chunk_feat)
+            features = torch.cat(chunks, dim=0)
+
+        self._cache_key = cache_key
+        self._cache_val = features.detach()
+        return self._cache_val
+
     def forward_with_grad(
         self,
         pixel_values: torch.Tensor,
@@ -442,6 +493,247 @@ class VLACriticModel(nn.Module):
 
         fused = torch.cat([vla_features, flight_norm], dim=-1)
         return self.mlp(fused)
+
+    def get_hidden_state(self):
+        return None
+
+    def reset(self, env_ids=None):
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Hierarchical VLA Actor — PaliGemma → Waypoint Head → Frozen Waypoint Policy
+# ---------------------------------------------------------------------------
+
+class HierarchicalVLAActor(nn.Module):
+    """Hierarchical VLA: PaliGemma → target waypoint → frozen waypoint nav policy.
+
+    Architecture:
+        RGB + text ──→ PaliGemma (frozen) ──→ 2048 features
+                                                    ↓
+                                              Waypoint head (trainable: 2048→128→3)
+                                                    ↓
+                                              target_pos_b (body frame, 3-dim)
+                                                    ↓
+                                              [flight_state_9 | target_pos_b | pos_error (=target_pos_b)]  ──→ (15-dim)
+                                                    ↓
+                                              Frozen waypoint nav policy (256×256 ELU)
+                                                    ↓
+                                              4-dim action (thrust + moment)
+
+    Only the waypoint head (~263K params) is trainable.
+    """
+
+    is_recurrent = False
+
+    def __init__(
+        self,
+        waypoint_checkpoint_path: str,
+        paligemma_model_name: str = "google/paligemma-3b-pt-224",
+        lora_rank: int = 0,  # ignored for compatibility
+        lora_alpha: float = 0.0,
+        init_std: float = 0.3,
+        target_range: float = 2.5,  # max |target_pos_b| output
+    ):
+        super().__init__()
+        self.target_range = target_range
+
+        # 1. PaliGemma feature extractor (fully frozen — no LoRA)
+        self.paligemma = PaliGemmaFeatureExtractor(
+            model_name=paligemma_model_name,
+            lora_rank=1,  # dummy, will be frozen
+            lora_alpha=1.0,
+        )
+        for p in self.paligemma.parameters():
+            p.requires_grad = False
+
+        # 2. Attention-based waypoint head
+        # Input: PaliGemma token sequence (B, seq_len, 2048) split into image tokens (first 256)
+        # and text tokens (remaining). Text tokens attend over image tokens via cross-attention,
+        # producing a command-conditioned scene summary.
+        self._num_image_tokens = 256
+        embed_dim = 256
+        self.image_proj = nn.Linear(PaliGemmaFeatureExtractor.FEATURE_DIM, embed_dim)
+        self.text_proj = nn.Linear(PaliGemmaFeatureExtractor.FEATURE_DIM, embed_dim)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=embed_dim, num_heads=4, batch_first=True
+        )
+        self.target_mlp = nn.Sequential(
+            nn.Linear(embed_dim + 9, 128),
+            nn.ELU(),
+            nn.Linear(128, 3),
+        )
+        # Zero-init final layer so the drone starts by hovering
+        nn.init.zeros_(self.target_mlp[-1].weight)
+        nn.init.zeros_(self.target_mlp[-1].bias)
+
+        # 3. Frozen waypoint nav policy (loaded from checkpoint)
+        self._build_waypoint_policy(waypoint_checkpoint_path)
+
+        # Gaussian action distribution for PPO
+        self._std_param = nn.Parameter(torch.ones(4) * math.log(init_std))
+        self._action_mean: torch.Tensor | None = None
+        self._action_std: torch.Tensor | None = None
+
+        # Log param counts
+        n_train = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        n_total = sum(p.numel() for p in self.parameters())
+        print(f"[VLA-Hier] Trainable: {n_train:,} / Total: {n_total:,} ({100*n_train/n_total:.3f}%)")
+
+    def _build_waypoint_policy(self, ckpt_path: str):
+        """Load waypoint nav policy weights as frozen buffers."""
+        print(f"[VLA-Hier] Loading frozen waypoint policy from {ckpt_path}")
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        state = ckpt["actor_state_dict"]
+        self.register_buffer("wp_w0", state["mlp.0.weight"].clone())
+        self.register_buffer("wp_b0", state["mlp.0.bias"].clone())
+        self.register_buffer("wp_w1", state["mlp.2.weight"].clone())
+        self.register_buffer("wp_b1", state["mlp.2.bias"].clone())
+        self.register_buffer("wp_w2", state["mlp.4.weight"].clone())
+        self.register_buffer("wp_b2", state["mlp.4.bias"].clone())
+        self.register_buffer("wp_obs_mean", state["obs_normalizer._mean"].clone())
+        self.register_buffer("wp_obs_std", state["obs_normalizer._std"].clone())
+
+    def _waypoint_policy_forward(self, obs_15: torch.Tensor) -> torch.Tensor:
+        """Frozen waypoint policy forward pass."""
+        x = (obs_15 - self.wp_obs_mean) / (self.wp_obs_std + 1e-8)
+        x = F.elu(F.linear(x, self.wp_w0, self.wp_b0))
+        x = F.elu(F.linear(x, self.wp_w1, self.wp_b1))
+        return F.linear(x, self.wp_w2, self.wp_b2)
+
+    def _compute_target_from_tokens(self, token_features: torch.Tensor, text_mask: torch.Tensor, flight_state: torch.Tensor) -> torch.Tensor:
+        """Attention-based target prediction from PaliGemma token sequence.
+
+        Args:
+            token_features: (B, seq_len, 2048)
+            text_mask: (B, seq_len)  — 1 for real tokens, 0 for padding
+            flight_state: (B, 9)
+
+        Returns:
+            target_body: (B, 3) in body frame, bounded by tanh * target_range
+        """
+        n_img = self._num_image_tokens  # 256
+        image_tokens = token_features[:, :n_img]       # (B, 256, 2048)
+        text_tokens = token_features[:, n_img:]        # (B, text_len, 2048)
+        text_mask_only = text_mask[:, n_img:]          # (B, text_len)
+
+        image_emb = self.image_proj(image_tokens)      # (B, 256, embed_dim)
+        text_emb = self.text_proj(text_tokens)         # (B, text_len, embed_dim)
+
+        # Cross-attention: text attends over image tokens
+        # key_padding_mask: True where PADDING (opposite of attention_mask)
+        key_padding_mask = None  # image tokens are all valid
+        fused, _ = self.cross_attn(
+            query=text_emb, key=image_emb, value=image_emb,
+            key_padding_mask=key_padding_mask,
+        )  # (B, text_len, embed_dim)
+
+        # Masked mean over valid text tokens
+        mask = text_mask_only.unsqueeze(-1).to(fused.dtype)  # (B, text_len, 1)
+        scene_summary = (fused * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)  # (B, embed_dim)
+
+        # Concat with flight state → predict target
+        head_input = torch.cat([scene_summary, flight_state], dim=-1)
+        target_body = torch.tanh(self.target_mlp(head_input)) * self.target_range  # (B, 3)
+        return target_body
+
+    def forward(self, obs: dict[str, torch.Tensor], masks=None, hidden_state=None, stochastic_output: bool = False) -> torch.Tensor:
+        # 1. Get PaliGemma token sequence (frozen, no grad)
+        if "vla_token_features" in obs and obs["vla_token_features"].abs().sum() > 0:
+            token_features = obs["vla_token_features"]
+        else:
+            rgb = obs["rgb"]
+            text_tokens = obs["text_tokens"].long()
+            text_mask = obs["text_mask"].long()
+            token_features = self.paligemma.get_token_features(rgb, text_tokens, text_mask)
+
+        # 2. Attention-based target prediction
+        flight_state = obs["policy"]  # (B, 9)
+        text_mask = obs["text_mask"]  # (B, seq_len)
+        target_body = self._compute_target_from_tokens(token_features, text_mask, flight_state)
+        self._last_target = target_body  # for auxiliary loss
+
+        # 3. Build 15-dim observation for waypoint policy
+        wp_obs = torch.cat([flight_state, target_body, target_body], dim=-1)  # (B, 15)
+
+        # 4. Run frozen waypoint policy
+        action_mean = self._waypoint_policy_forward(wp_obs)
+        self._action_mean = action_mean
+        self._action_std = self._std_param.exp().expand_as(action_mean)
+
+        if stochastic_output:
+            dist = torch.distributions.Normal(action_mean, self._action_std)
+            return dist.sample()
+        return action_mean
+
+    @property
+    def output_distribution_params(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._action_mean, self._action_std
+
+    def get_output_log_prob(self, outputs: torch.Tensor) -> torch.Tensor:
+        dist = torch.distributions.Normal(self._action_mean, self._action_std)
+        return dist.log_prob(outputs).sum(dim=-1)
+
+    @property
+    def output_entropy(self) -> torch.Tensor:
+        dist = torch.distributions.Normal(self._action_mean, self._action_std)
+        return dist.entropy().sum(dim=-1)
+
+    def update_normalization(self, obs: dict[str, torch.Tensor]):
+        # No-op: waypoint policy has its own frozen normalizer, and PaliGemma
+        # features don't need normalization (already normalized internally).
+        pass
+
+    def get_hidden_state(self):
+        return None
+
+    def reset(self, env_ids=None):
+        self.paligemma.clear_cache()
+
+
+class HierarchicalVLACritic(nn.Module):
+    """Value head on PaliGemma features + flight state.
+
+    The PaliGemma backbone is shared with the actor (set after construction).
+    Only this MLP is trainable.
+    """
+
+    is_recurrent = False
+
+    def __init__(self, flight_state_dim: int = 9):
+        super().__init__()
+        fused_dim = PaliGemmaFeatureExtractor.FEATURE_DIM + flight_state_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(fused_dim, 256),
+            nn.ELU(),
+            nn.Linear(256, 256),
+            nn.ELU(),
+            nn.Linear(256, 1),
+        )
+        self._shared_paligemma: PaliGemmaFeatureExtractor | None = None
+
+    def forward(self, obs: dict[str, torch.Tensor], masks=None, hidden_state=None, stochastic_output: bool = False) -> torch.Tensor:
+        # Use token-level features (shared with actor cache) then pool
+        if "vla_token_features" in obs and obs["vla_token_features"].abs().sum() > 0:
+            token_features = obs["vla_token_features"]  # (B, seq_len, 2048)
+        else:
+            assert self._shared_paligemma is not None
+            rgb = obs["rgb"]
+            text_tokens = obs["text_tokens"].long()
+            text_mask = obs["text_mask"].long()
+            token_features = self._shared_paligemma.get_token_features(rgb, text_tokens, text_mask)
+
+        # Pool token features for critic (simple mean over non-padded tokens)
+        text_mask = obs["text_mask"]  # (B, seq_len)
+        mask = text_mask.unsqueeze(-1).to(token_features.dtype)
+        vla_features = (token_features * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
+
+        flight_state = obs["policy"]
+        fused = torch.cat([vla_features, flight_state], dim=-1)
+        return self.mlp(fused)
+
+    def update_normalization(self, obs: dict[str, torch.Tensor]):
+        pass
 
     def get_hidden_state(self):
         return None

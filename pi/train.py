@@ -1,9 +1,12 @@
-"""Train VLA (PaliGemma 3B + LoRA) drone navigation policy.
+"""Train Pi0-based drone navigation policy.
+
+Uses Pi0's PaliGemma backbone (frozen) with a trainable MLP action head.
+No LoRA -- only the MLP + action std are trained via PPO.
 
 Launch:
     cd /home/ubuntu/IsaacLab
-    ./isaaclab.sh -p /home/ubuntu/drone_project/vla/train.py \
-        --num_envs 256 --max_iterations 5000 --headless --enable_cameras
+    ./isaaclab.sh -p /home/ubuntu/drone_project/pi/train.py \
+        --num_envs 512 --max_iterations 5000 --headless --enable_cameras
 
 Optional:
     --resume_path  Path to transferred waypoint checkpoint for action head seeding
@@ -14,8 +17,8 @@ import sys
 
 from isaaclab.app import AppLauncher
 
-parser = argparse.ArgumentParser(description="Train VLA drone navigation policy.")
-parser.add_argument("--num_envs", type=int, default=256, help="Parallel envs (256 for A10, 512 for H100)")
+parser = argparse.ArgumentParser(description="Train Pi0 drone navigation policy.")
+parser.add_argument("--num_envs", type=int, default=512, help="Parallel envs (512 for GH200)")
 parser.add_argument("--max_iterations", type=int, default=5000)
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--resume_path", type=str, default=None, help="Path to action head checkpoint (.pt)")
@@ -44,19 +47,19 @@ _DRONE_PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _DRONE_PROJECT not in sys.path:
     sys.path.insert(0, _DRONE_PROJECT)
 
-import vla  # noqa: F401 — registers Isaac-VLADrone-Direct-v0
+import pi  # noqa: F401 -- registers Isaac-Pi0Drone-Direct-v0
 
 from vla.vla_drone_env import VLADroneEnvCfg
-from vla.vla_policy import VLAActorModel, VLACriticModel, HierarchicalVLAActor, HierarchicalVLACritic
-from vla.agents.rsl_rl_ppo_cfg import VLADronePPORunnerCfg
+from pi.pi0_policy import Pi0ActorModel, Pi0CriticModel
+from pi.agents.rsl_rl_ppo_cfg import Pi0DronePPORunnerCfg
 
 
-class VLAPolicy(nn.Module):
-    """Wrapper that makes VLA actor+critic look like RSL-RL's ActorCritic."""
+class Pi0Policy(nn.Module):
+    """Wrapper that makes Pi0 actor+critic look like RSL-RL's ActorCritic."""
 
     is_recurrent = False
 
-    def __init__(self, actor: VLAActorModel, critic: VLACriticModel):
+    def __init__(self, actor: Pi0ActorModel, critic: Pi0CriticModel):
         super().__init__()
         self.actor = actor
         self.critic = critic
@@ -110,7 +113,7 @@ def main():
     env_cfg.seed = args_cli.seed
     env_cfg.sim.device = args_cli.device if args_cli.device else "cuda:0"
 
-    agent_cfg = VLADronePPORunnerCfg()
+    agent_cfg = Pi0DronePPORunnerCfg()
     agent_cfg.max_iterations = args_cli.max_iterations
     agent_cfg.device = env_cfg.sim.device
     agent_cfg.seed = args_cli.seed
@@ -123,59 +126,61 @@ def main():
     os.makedirs(log_dir, exist_ok=True)
 
     # Create environment
-    env = gym.make("Isaac-VLADrone-Direct-v0", cfg=env_cfg)
+    env = gym.make("Isaac-Pi0Drone-Direct-v0", cfg=env_cfg)
     env = RslRlVecEnvWrapper(env)
     device = agent_cfg.device
 
     # ---------------------------------------------------------------
-    # Construct Hierarchical VLA actor + critic
+    # Construct Pi0 actor + critic
     # ---------------------------------------------------------------
-    waypoint_ckpt = os.path.join(_DRONE_PROJECT, "model_2998_waypoint.pt")
-    print(f"[INFO] Constructing Hierarchical VLA actor (PaliGemma frozen + frozen waypoint policy)...")
-    actor = HierarchicalVLAActor(
-        waypoint_checkpoint_path=waypoint_ckpt,
-        paligemma_model_name="google/paligemma-3b-pt-224",
-        init_std=0.3,
-        target_range=1.5,
+    print("[INFO] Constructing Pi0 actor (frozen backbone + MLP action head)...")
+    actor = Pi0ActorModel(
+        flight_state_dim=9,
+        action_dim=4,
+        hidden_dims=[256, 256],
+        activation="elu",
+        init_std=0.6,
     ).to(device)
 
-    print("[INFO] Constructing Hierarchical VLA critic...")
-    critic = HierarchicalVLACritic(flight_state_dim=9).to(device)
-    critic._shared_paligemma = actor.paligemma
-    print("[INFO] Linked shared PaliGemma backbone between actor and critic.")
+    print("[INFO] Constructing Pi0 critic...")
+    critic = Pi0CriticModel(
+        flight_state_dim=9,
+        hidden_dims=[256, 256],
+        activation="elu",
+    ).to(device)
+
+    critic._shared_pi0 = actor.pi0
+    print("[INFO] Linked shared Pi0 backbone between actor and critic.")
+
+    # Load action head weights
+    if args_cli.resume_path:
+        print(f"[INFO] Loading action head from: {args_cli.resume_path}")
+        ckpt = torch.load(args_cli.resume_path, map_location=device, weights_only=False)
+        missing_a, unexpected_a = actor.load_state_dict(ckpt.get("actor_state_dict", {}), strict=False)
+        missing_c, unexpected_c = critic.load_state_dict(ckpt.get("critic_state_dict", {}), strict=False)
+        print(f"  Actor: {len(missing_a)} missing, {len(unexpected_a)} unexpected keys")
+        print(f"  Critic: {len(missing_c)} missing, {len(unexpected_c)} unexpected keys")
 
     n_actor_train = sum(p.numel() for p in actor.parameters() if p.requires_grad)
+    n_actor_total = sum(p.numel() for p in actor.parameters())
     n_critic_train = sum(p.numel() for p in critic.parameters() if p.requires_grad)
-    print(f"[INFO] Actor trainable: {n_actor_train:,} params")
-    print(f"[INFO] Critic trainable: {n_critic_train:,} params")
+    print(f"[INFO] Actor: {n_actor_train:,} trainable / {n_actor_total:,} total params")
+    print(f"[INFO] Critic: {n_critic_train:,} trainable params")
 
     # ---------------------------------------------------------------
-    # Create PPO
+    # Create PPO (single optimizer for MLP + std only)
     # ---------------------------------------------------------------
-    policy = VLAPolicy(actor, critic).to(device)
+    policy = Pi0Policy(actor, critic).to(device)
 
     alg_cfg = agent_cfg.algorithm.to_dict()
     alg_cfg.pop("class_name", None)
 
     ppo = PPO(policy=policy, device=device, **alg_cfg)
 
-    # Only train non-PaliGemma, non-frozen-waypoint-buffer params
-    trainable_params = [p for name, p in policy.named_parameters() if p.requires_grad]
-    ppo.optimizer = torch.optim.Adam(trainable_params, lr=alg_cfg["learning_rate"])
-    print(f"[INFO] PPO optimizer: {sum(p.numel() for p in trainable_params):,} trainable params")
-
-    # Resume from checkpoint if provided
-    if args_cli.resume_path:
-        print(f"[INFO] Resuming from checkpoint: {args_cli.resume_path}")
-        ckpt = torch.load(args_cli.resume_path, map_location=device, weights_only=False)
-        missing, unexpected = policy.load_state_dict(ckpt.get("model_state_dict", {}), strict=False)
-        print(f"  Loaded policy: {len(missing)} missing, {len(unexpected)} unexpected keys")
-        if "optimizer_state_dict" in ckpt:
-            try:
-                ppo.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-                print(f"  Loaded optimizer state")
-            except Exception as e:
-                print(f"  Skipping optimizer state: {e}")
+    # PPO's optimizer automatically picks up only requires_grad=True params
+    # (MLP weights + _std_param), since Pi0 backbone is fully frozen.
+    n_optim = sum(p.numel() for group in ppo.optimizer.param_groups for p in group["params"])
+    print(f"[INFO] PPO optimizer: {n_optim:,} params (MLP + std only)")
 
     # Init rollout storage
     obs = env.get_observations()
@@ -188,7 +193,7 @@ def main():
     )
 
     # ---------------------------------------------------------------
-    # Training loop (replaces OnPolicyRunner.learn)
+    # Training loop
     # ---------------------------------------------------------------
     num_steps_per_env = agent_cfg.num_steps_per_env
     max_iterations = agent_cfg.max_iterations
@@ -211,7 +216,7 @@ def main():
     # Randomize initial episode lengths
     env.episode_length_buf = torch.randint_like(env.episode_length_buf, high=int(env.max_episode_length))
 
-    print(f"[INFO] Starting VLA training: {max_iterations} iterations, {args_cli.num_envs} envs")
+    print(f"[INFO] Starting Pi0 training: {max_iterations} iterations, {args_cli.num_envs} envs")
 
     for it in range(max_iterations):
         start = time.time()
@@ -220,8 +225,11 @@ def main():
         with torch.inference_mode():
             for _ in range(num_steps_per_env):
                 actions = ppo.act(obs)
-                # Clear PaliGemma cache between rollout steps (obs changes)
-                policy.actor.paligemma.clear_cache()
+                # Stash Pi0 features into stored obs so PPO replay skips the 3B model
+                cached_feat = policy.actor.pi0._cache_val
+                if cached_feat is not None:
+                    ppo.transition.observations["vla_features"] = cached_feat.detach()
+                policy.actor.pi0.clear_cache()
 
                 obs, rewards, dones, extras = env.step(actions.to(env.device))
                 obs, rewards, dones = obs.to(device), rewards.to(device), dones.to(device)
@@ -235,40 +243,9 @@ def main():
                 cur_reward_sum[new_ids] = 0
                 cur_episode_length[new_ids] = 0
 
-        # -- PPO Update --
+        # -- PPO Update (no LoRA step) --
         ppo.compute_returns(obs)
         loss_dict = ppo.update()
-
-        # -- Auxiliary supervised loss: predict ground-truth target from PaliGemma features --
-        # Gives the attention head a dense signal for "where should I point" in addition to PPO.
-        aux_batch_size = 32
-        storage = ppo.storage
-        flat_obs = storage.observations.flatten(0, 1)
-        total_samples = flat_obs.batch_size[0]
-        aux_idx = torch.randint(0, total_samples, (aux_batch_size,), device=device)
-        aux_obs = {k: flat_obs[k][aux_idx].clone() for k in flat_obs.keys()}
-        aux_gt = aux_obs["target_gt_body"]  # (B, 3)
-
-        # Forward through actor's attention head (with gradients)
-        import torch.nn.functional as F_aux
-        ppo.optimizer.zero_grad()
-        # Compute token features (no grad through PaliGemma, always frozen)
-        with torch.no_grad():
-            token_features = actor.paligemma.get_token_features(
-                aux_obs["rgb"], aux_obs["text_tokens"].long(), aux_obs["text_mask"].long()
-            )
-        # Attention head forward WITH gradients
-        target_pred = actor._compute_target_from_tokens(
-            token_features, aux_obs["text_mask"], aux_obs["policy"]
-        )
-        aux_loss = F_aux.mse_loss(target_pred, aux_gt)
-        aux_loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            [p for p in actor.parameters() if p.requires_grad], 0.5
-        )
-        ppo.optimizer.step()
-        loss_dict["aux_target_mse"] = aux_loss.item()
-        actor.paligemma.clear_cache()
 
         stop = time.time()
 
@@ -301,8 +278,7 @@ def main():
             print(
                 f"[{it:5d}/{max_iterations}]  reward={mean_reward:7.2f}  "
                 f"ep_len={mean_ep_len:6.1f}  fps={fps:7.0f}  "
-                f"surr={loss_dict.get('surrogate', 0):.4f}  val={loss_dict.get('value_function', 0):.4f}  "
-                f"aux={loss_dict.get('aux_target_mse', 0):.3f}"
+                f"surr={loss_dict.get('surrogate', 0):.4f}  val={loss_dict.get('value_function', 0):.4f}"
             )
 
         # -- Save --
