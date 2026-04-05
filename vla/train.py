@@ -220,7 +220,10 @@ def main():
         with torch.inference_mode():
             for _ in range(num_steps_per_env):
                 actions = ppo.act(obs)
-                # Clear PaliGemma cache between rollout steps (obs changes)
+                # Stash token features into rollout buffer so PPO update skips PaliGemma
+                cached = policy.actor.paligemma._cache_val
+                if cached is not None:
+                    ppo.transition.observations["vla_token_features"] = cached.detach().half()
                 policy.actor.paligemma.clear_cache()
 
                 obs, rewards, dones, extras = env.step(actions.to(env.device))
@@ -246,20 +249,18 @@ def main():
         flat_obs = storage.observations.flatten(0, 1)
         total_samples = flat_obs.batch_size[0]
         aux_idx = torch.randint(0, total_samples, (aux_batch_size,), device=device)
-        aux_obs = {k: flat_obs[k][aux_idx].clone() for k in flat_obs.keys()}
-        aux_gt = aux_obs["target_gt_body"]  # (B, 3)
+        aux_gt = flat_obs["target_gt_body"][aux_idx].clone()  # (B, 3)
 
-        # Forward through actor's attention head (with gradients)
+        # Use cached token features from rollout (no PaliGemma re-forward)
         import torch.nn.functional as F_aux
         ppo.optimizer.zero_grad()
-        # Compute token features (no grad through PaliGemma, always frozen)
-        with torch.no_grad():
-            token_features = actor.paligemma.get_token_features(
-                aux_obs["rgb"], aux_obs["text_tokens"].long(), aux_obs["text_mask"].long()
-            )
+        token_features = flat_obs["vla_token_features"][aux_idx].clone().float()  # fp16 → fp32
+        text_mask = flat_obs["text_mask"][aux_idx].clone()
+        flight_state = flat_obs["policy"][aux_idx].clone()
+
         # Attention head forward WITH gradients
         target_pred = actor._compute_target_from_tokens(
-            token_features, aux_obs["text_mask"], aux_obs["policy"]
+            token_features, text_mask, flight_state
         )
         aux_loss = F_aux.mse_loss(target_pred, aux_gt)
         aux_loss.backward()

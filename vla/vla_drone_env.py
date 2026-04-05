@@ -376,6 +376,7 @@ class VLADroneEnv(DirectRLEnv):
             "text_tokens": self._text_tokens,    # (N, 280) long
             "text_mask": self._text_mask,        # (N, 280) long
             "target_gt_body": target_gt_body,    # (N, 3) — privileged GT for aux loss
+            "vla_token_features": torch.zeros(self.num_envs, self.cfg.max_text_length, 2048, dtype=torch.float16, device=self.device),  # placeholder, filled by train loop
         }
 
     # ------------------------------------------------------------------

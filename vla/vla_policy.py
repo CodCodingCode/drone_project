@@ -640,7 +640,7 @@ class HierarchicalVLAActor(nn.Module):
     def forward(self, obs: dict[str, torch.Tensor], masks=None, hidden_state=None, stochastic_output: bool = False) -> torch.Tensor:
         # 1. Get PaliGemma token sequence (frozen, no grad)
         if "vla_token_features" in obs and obs["vla_token_features"].abs().sum() > 0:
-            token_features = obs["vla_token_features"]
+            token_features = obs["vla_token_features"].float()  # fp16 cache → fp32
         else:
             rgb = obs["rgb"]
             text_tokens = obs["text_tokens"].long()
@@ -715,7 +715,7 @@ class HierarchicalVLACritic(nn.Module):
     def forward(self, obs: dict[str, torch.Tensor], masks=None, hidden_state=None, stochastic_output: bool = False) -> torch.Tensor:
         # Use token-level features (shared with actor cache) then pool
         if "vla_token_features" in obs and obs["vla_token_features"].abs().sum() > 0:
-            token_features = obs["vla_token_features"]  # (B, seq_len, 2048)
+            token_features = obs["vla_token_features"].float()  # (B, seq_len, 2048)
         else:
             assert self._shared_paligemma is not None
             rgb = obs["rgb"]
