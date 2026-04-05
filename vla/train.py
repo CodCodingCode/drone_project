@@ -164,6 +164,16 @@ def main():
     ppo.optimizer = torch.optim.Adam(trainable_params, lr=alg_cfg["learning_rate"])
     print(f"[INFO] PPO optimizer: {sum(p.numel() for p in trainable_params):,} trainable params")
 
+    # Separate optimizer for aux loss — only trains actor's attention head params
+    # (text_proj, image_proj, cross_attn, target_mlp). Uses higher LR since it's
+    # a supervised regression signal.
+    actor_head_params = [
+        p for name, p in actor.named_parameters()
+        if p.requires_grad and any(k in name for k in ["text_proj", "image_proj", "cross_attn", "target_mlp"])
+    ]
+    aux_optimizer = torch.optim.Adam(actor_head_params, lr=1e-4)
+    print(f"[INFO] Aux optimizer: {sum(p.numel() for p in actor_head_params):,} attention head params")
+
     # Resume from checkpoint if provided
     if args_cli.resume_path:
         print(f"[INFO] Resuming from checkpoint: {args_cli.resume_path}")
@@ -205,6 +215,7 @@ def main():
     lenbuffer = deque(maxlen=100)
     cur_reward_sum = torch.zeros(env.num_envs, dtype=torch.float, device=device)
     cur_episode_length = torch.zeros(env.num_envs, dtype=torch.float, device=device)
+    best_reward = -float("inf")  # track best reward for best-checkpoint saving
     tot_timesteps = 0
     tot_time = 0.0
 
@@ -238,38 +249,38 @@ def main():
                 cur_reward_sum[new_ids] = 0
                 cur_episode_length[new_ids] = 0
 
-        # -- PPO Update --
-        ppo.compute_returns(obs)
-        loss_dict = ppo.update()
-
         # -- Auxiliary supervised loss: predict ground-truth target from PaliGemma features --
-        # Gives the attention head a dense signal for "where should I point" in addition to PPO.
-        aux_batch_size = 32
+        # Runs BEFORE PPO update, so PPO starts from a head that knows where targets are.
+        # Uses SEPARATE optimizer so PPO gradients don't overwhelm the aux signal.
+        import torch.nn.functional as F_aux
         storage = ppo.storage
         flat_obs = storage.observations.flatten(0, 1)
         total_samples = flat_obs.batch_size[0]
-        aux_idx = torch.randint(0, total_samples, (aux_batch_size,), device=device)
-        aux_gt = flat_obs["target_gt_body"][aux_idx].clone()  # (B, 3)
 
-        # Use cached token features from rollout (no PaliGemma re-forward)
-        import torch.nn.functional as F_aux
-        ppo.optimizer.zero_grad()
-        token_features = flat_obs["vla_token_features"][aux_idx].clone().float()  # fp16 → fp32
-        text_mask = flat_obs["text_mask"][aux_idx].clone()
-        flight_state = flat_obs["policy"][aux_idx].clone()
+        # Train aux loss on multiple mini-batches (like PPO epochs) for balance
+        aux_losses = []
+        for _ in range(4):  # 4 aux gradient steps per iteration
+            aux_idx = torch.randint(0, total_samples, (64,), device=device)
+            aux_gt = flat_obs["target_gt_body"][aux_idx]
+            token_features = flat_obs["vla_token_features"][aux_idx].float()
+            text_mask = flat_obs["text_mask"][aux_idx]
+            flight_state = flat_obs["policy"][aux_idx]
 
-        # Attention head forward WITH gradients
-        target_pred = actor._compute_target_from_tokens(
-            token_features, text_mask, flight_state
-        )
-        aux_loss = F_aux.mse_loss(target_pred, aux_gt)
-        aux_loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            [p for p in actor.parameters() if p.requires_grad], 0.5
-        )
-        ppo.optimizer.step()
-        loss_dict["aux_target_mse"] = aux_loss.item()
+            aux_optimizer.zero_grad()
+            target_pred = actor._compute_target_from_tokens(
+                token_features, text_mask, flight_state
+            )
+            aux_loss = F_aux.mse_loss(target_pred, aux_gt)
+            aux_loss.backward()
+            torch.nn.utils.clip_grad_norm_(actor_head_params, 1.0)
+            aux_optimizer.step()
+            aux_losses.append(aux_loss.item())
         actor.paligemma.clear_cache()
+
+        # -- PPO Update --
+        ppo.compute_returns(obs)
+        loss_dict = ppo.update()
+        loss_dict["aux_target_mse"] = sum(aux_losses) / len(aux_losses)
 
         stop = time.time()
 
@@ -316,6 +327,17 @@ def main():
             }, path)
             if it % save_interval == 0:
                 print(f"[INFO] Saved checkpoint: {path}")
+
+        # -- Save best checkpoint whenever mean_reward exceeds prior best --
+        if mean_reward > best_reward and len(rewbuffer) >= 20:
+            best_reward = mean_reward
+            best_path = os.path.join(log_dir, "best_model.pt")
+            torch.save({
+                "model_state_dict": policy.state_dict(),
+                "optimizer_state_dict": ppo.optimizer.state_dict(),
+                "iter": it,
+                "best_reward": best_reward,
+            }, best_path)
 
     writer.close()
     env.close()
