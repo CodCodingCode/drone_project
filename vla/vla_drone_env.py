@@ -6,7 +6,7 @@ PaliGemma processes these inside the policy network (vla_policy.py).
 
 Observation (multi-group dict):
   "policy"      (N, 9)         flight state
-  "rgb"         (N, 64, 64, 3) raw camera image [0, 1] float
+  "rgb"         (N, 224, 224, 3) raw camera image [0, 1] float
   "text_tokens" (N, 32)        tokenized text command IDs
   "text_mask"   (N, 32)        attention mask
 """
@@ -29,7 +29,7 @@ from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
-from isaaclab.utils.math import quat_apply, subtract_frame_transforms
+from isaaclab.utils.math import quat_apply, quat_mul, subtract_frame_transforms
 
 from isaaclab_assets import CRAZYFLIE_CFG  # isort: skip
 
@@ -94,10 +94,10 @@ class VLADroneEnvCfg(DirectRLEnvCfg):
     thrust_to_weight = 1.9
     moment_scale = 0.01
 
-    # Onboard camera (64x64 RGB)
+    # Onboard camera (224x224 RGB — PaliGemma's native resolution, no upscaling needed)
     tiled_camera: TiledCameraCfg = TiledCameraCfg(
         prim_path="/World/envs/env_.*/Camera",
-        offset=TiledCameraCfg.OffsetCfg(pos=(0.0, 0.0, 0.0), rot=(0.5, -0.5, 0.5, -0.5), convention="world"),
+        offset=TiledCameraCfg.OffsetCfg(pos=(0.0, 0.0, 0.0), rot=(0.5, 0.5, -0.5, -0.5), convention="world"),
         data_types=["rgb"],
         spawn=sim_utils.PinholeCameraCfg(
             focal_length=16.0,
@@ -105,35 +105,38 @@ class VLADroneEnvCfg(DirectRLEnvCfg):
             horizontal_aperture=15.0,
             clipping_range=(0.01, 20.0),
         ),
-        width=64,
-        height=64,
+        width=224,
+        height=224,
     )
     camera_body_offset_pos = (0.05, 0.0, 0.01)
 
     # How often to grab camera frames (every N physics steps)
-    camera_every_n = 3
+    camera_every_n = 4  # every 4 steps (80ms gap) — trade temporal freq for native-res spatial quality
 
     # PaliGemma tokenizer name (lightweight, no model weights loaded in env)
     tokenizer_name = "google/paligemma-3b-pt-224"
     max_text_length = _MAX_TEXT_LEN
 
     # Reward scales — stability (always active)
-    lin_vel_reward_scale = -0.02
+    lin_vel_reward_scale = 0.0   # don't penalize movement — we want navigation
     ang_vel_reward_scale = -0.005
-    alive_reward = 0.3  # minimal — waypoint policy handles flight, no need to bribe survival
+    alive_reward = 0.0  # waypoint policy handles flight stability, no free reward for existing
     uprightness_reward_scale = 0.2
     altitude_warning_low = 0.3
     altitude_warning_high = 2.8
     crash_penalty_scale = -10.0
 
     # Reward scales — navigation (gated by nav_multiplier)
-    distance_to_goal_reward_scale = 25.0
+    distance_to_goal_reward_scale = 35.0
     velocity_toward_goal_scale = 4.0
     proximity_scale = 8.0
     proximity_radius = 1.5
-    success_reward = 10.0
-    hover_at_target_reward = 20.0  # sustained reward for holding position near target (~0.4/step, 13x alive)
-    hover_at_target_radius = 0.6  # radius for hover reward
+    success_reward = 25.0
+    hover_at_target_reward = 30.0  # base reward when conditions met; scales with dwell time
+    hover_at_target_radius = 0.5   # moderate radius — small enough to be "at target"
+    hover_max_speed = 1.0          # relaxed — waypoint policy doesn't naturally brake hard
+    hover_dwell_bonus = 3.0        # big bonus for sustained hovering (up to 4x base at dwell cap)
+    hover_max_dwell_steps = 50     # dwell counter caps here (1.0s at 50Hz env step)
     wrong_object_penalty = -3.0
 
     success_threshold = 0.35
@@ -144,11 +147,12 @@ class VLADroneEnvCfg(DirectRLEnvCfg):
     alive_fadeout_steps = 1  # alive is minimal from the start
     alive_min_scale = 0.2
 
-    # Precision curriculum disabled — aux loss provides direct supervised signal
-    precision_curriculum_start = 999999999  # effectively off
-    precision_curriculum_steps = 1
-    hover_radius_start = 0.6
-    hover_radius_end = 0.6
+    # Precision curriculum: after ~200 iters of learning "get close," fade distance/proximity
+    # rewards down and boost hover/success rewards so the drone must stop at targets
+    precision_curriculum_start = 409600     # ~200 iters (8 steps × 256 envs × 200)
+    precision_curriculum_steps = 614400    # fade over ~300 more iters (done by ~500 iters)
+    hover_radius_start = 0.5
+    hover_radius_end = 0.5
 
 
 class VLADroneEnv(DirectRLEnv):
@@ -171,11 +175,19 @@ class VLADroneEnv(DirectRLEnv):
         self._text_mask = torch.zeros(self.num_envs, self.cfg.max_text_length, dtype=torch.long, device=self.device)
 
         # Cached camera image (updated every N steps)
-        self._cached_rgb = torch.zeros(self.num_envs, 64, 64, 3, dtype=torch.float32, device=self.device)
+        self._cached_rgb = torch.zeros(self.num_envs, 224, 224, 3, dtype=torch.float32, device=self.device)
         self._steps_since_capture = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+
+        # Dwell counter: consecutive steps inside hover zone with low speed
+        self._hover_dwell = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
 
         # Camera body-frame offset
         self._cam_offset = torch.tensor(self.cfg.camera_body_offset_pos, dtype=torch.float32, device=self.device)
+        # Camera orientation offset (forward-facing, upright) in drone body frame
+        # Quaternion (w,x,y,z) = (0.5, 0.5, -0.5, -0.5) rotates Isaac default camera (-Z view, +Y up)
+        # to match drone body frame (camera looks at +X, up is +Z)
+        # Verified by quaternion math: roll=90°, pitch=0°, yaw=-90°
+        self._cam_rot_offset = torch.tensor([0.5, 0.5, -0.5, -0.5], dtype=torch.float32, device=self.device)
 
         # World positions of all 3 objects: (num_envs, 3, 3) — randomized at each reset
         self._obj_pos_w = torch.zeros(self.num_envs, 3, 3, dtype=torch.float32, device=self.device)
@@ -289,12 +301,15 @@ class VLADroneEnv(DirectRLEnv):
         drone_pos = self._robot.data.root_pos_w
         drone_quat = self._robot.data.root_quat_w
         cam_pos = drone_pos + quat_apply(drone_quat, self._cam_offset.expand(self.num_envs, -1))
-        self._camera._view.set_world_poses(cam_pos, drone_quat)
+        # Compose drone orientation with camera offset: world_rot = drone_rot * cam_offset
+        cam_offset = self._cam_rot_offset.unsqueeze(0).expand(self.num_envs, -1)
+        cam_quat = quat_mul(drone_quat, cam_offset)
+        self._camera._view.set_world_poses(cam_pos, cam_quat)
 
     def _maybe_capture_camera(self):
         self._steps_since_capture += 1
         if (self._steps_since_capture >= self.cfg.camera_every_n).any():
-            rgb = self._camera.data.output["rgb"][:, :, :, :3]  # (N, 64, 64, 3) uint8
+            rgb = self._camera.data.output["rgb"][:, :, :, :3]  # (N, 224, 224, 3) uint8
             self._cached_rgb = rgb.float() / 255.0  # → [0, 1]
             self._steps_since_capture.zero_()
 
@@ -370,13 +385,17 @@ class VLADroneEnv(DirectRLEnv):
             target_pos_w,
         )  # (N, 3)
 
+        # World-frame position error (needed by frozen waypoint policy for slots 12-15)
+        pos_error_w = target_pos_w - self._robot.data.root_pos_w  # (N, 3)
+
         return {
             "policy": flight_state,              # (N, 9)
             "rgb": self._cached_rgb,             # (N, 64, 64, 3) float [0,1]
             "text_tokens": self._text_tokens,    # (N, 280) long
             "text_mask": self._text_mask,        # (N, 280) long
-            "target_gt_body": target_gt_body,    # (N, 3) — privileged GT for aux loss
             "vla_token_features": torch.zeros(self.num_envs, self.cfg.max_text_length, 2048, dtype=torch.float16, device=self.device),  # placeholder, filled by train loop
+            "target_gt_body": target_gt_body,    # (N, 3) ground-truth target in body frame for aux supervision
+            "pos_error_w": pos_error_w,          # (N, 3) world-frame position error for frozen waypoint policy
         }
 
     # ------------------------------------------------------------------
@@ -401,11 +420,26 @@ class VLADroneEnv(DirectRLEnv):
         inside_radius = (dist_to_target < self.cfg.proximity_radius).float()
         proximity = inside_radius * (1.0 - dist_to_target / self.cfg.proximity_radius)
 
-        # Hover reward with curriculum: radius shrinks from 0.6 → 0.3 over training
+        # Real hover reward: inside radius AND low speed, scales with consecutive dwell time
         precision = self._get_precision_scale()  # 0.0 → 1.0
         hover_radius = self.cfg.hover_radius_start + precision * (self.cfg.hover_radius_end - self.cfg.hover_radius_start)
-        near_target = (dist_to_target < hover_radius).float()
-        hover_at_target = near_target
+        near_target = (dist_to_target < hover_radius)
+        speed = torch.linalg.norm(self._robot.data.root_lin_vel_w, dim=1)
+        slow = (speed < self.cfg.hover_max_speed)
+        hovering = near_target & slow  # bool
+
+        # Update dwell counter: +1 when hovering, reset to 0 when not
+        self._hover_dwell = torch.where(
+            hovering,
+            (self._hover_dwell + 1.0).clamp(max=float(self.cfg.hover_max_dwell_steps)),
+            torch.zeros_like(self._hover_dwell),
+        )
+        # Reward scales linearly from base to base + bonus*max_dwell as dwell time grows
+        # At step 1 hovering: reward = 1.0x base
+        # At step 50 hovering: reward = (1 + dwell_bonus) * base = 3x base (if bonus=2.0)
+        dwell_ratio = self._hover_dwell / float(self.cfg.hover_max_dwell_steps)  # 0.0 → 1.0
+        dwell_multiplier = 1.0 + self.cfg.hover_dwell_bonus * dwell_ratio
+        hover_at_target = hovering.float() * dwell_multiplier
 
         uprightness = -self._robot.data.projected_gravity_b[:, 2]
 
@@ -492,6 +526,34 @@ class VLADroneEnv(DirectRLEnv):
             extras[f"Episode_Reward/{key}"] = avg / self.max_episode_length_s
             self._episode_sums[key][env_ids] = 0.0
         extras["Curriculum/nav_multiplier"] = self._get_nav_multiplier()
+        extras["Curriculum/precision_scale"] = self._get_precision_scale()
+
+        # Termination breakdown: why did episodes end?
+        drone_pos = self._robot.data.root_pos_w[env_ids]
+        target_pos = self._obj_pos_w[env_ids, self._target_obj_idx[env_ids]]
+        dist = torch.linalg.norm(target_pos - drone_pos, dim=1)
+
+        wrong_mask = torch.ones(len(env_ids), 3, dtype=torch.bool, device=self.device)
+        wrong_mask[torch.arange(len(env_ids), device=self.device), self._target_obj_idx[env_ids]] = False
+        wrong_obj_pos = self._obj_pos_w[env_ids][wrong_mask].reshape(len(env_ids), 2, 3)
+        dist_to_wrong = torch.linalg.norm(wrong_obj_pos - drone_pos.unsqueeze(1), dim=-1).min(dim=1).values
+
+        success_term = (dist < self.cfg.success_threshold).float().mean()
+        wrong_term = (dist_to_wrong < self.cfg.success_threshold).float().mean()
+        fell_term = ((drone_pos[:, 2] < 0.1) | (drone_pos[:, 2] > 3.0)).float().mean()
+        timeout_term = (self.episode_length_buf[env_ids] >= self.max_episode_length - 1).float().mean()
+
+        extras["Termination/success_rate"] = success_term
+        extras["Termination/wrong_object_rate"] = wrong_term
+        extras["Termination/fell_rate"] = fell_term
+        extras["Termination/timeout_rate"] = timeout_term
+
+        # Distance diagnostics (at episode end)
+        extras["Diagnostic/final_dist_to_target"] = dist.mean()
+        extras["Diagnostic/final_dist_to_wrong"] = dist_to_wrong.mean()
+        extras["Diagnostic/mean_speed"] = torch.linalg.norm(self._robot.data.root_lin_vel_w[env_ids], dim=1).mean()
+        extras["Diagnostic/mean_hover_dwell"] = self._hover_dwell[env_ids].mean()
+
         self.extras["log"] = extras
 
         self._log_step += 1
@@ -593,3 +655,6 @@ class VLADroneEnv(DirectRLEnv):
 
         # Force camera capture on next step
         self._steps_since_capture[env_ids] = self.cfg.camera_every_n
+
+        # Reset hover dwell counter
+        self._hover_dwell[env_ids] = 0.0

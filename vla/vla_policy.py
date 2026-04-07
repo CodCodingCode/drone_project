@@ -121,13 +121,14 @@ class PaliGemmaFeatureExtractor(nn.Module):
         """GPU-side image preprocessing.
 
         Args:
-            rgb: (N, 64, 64, 3) float [0, 1]
+            rgb: (N, H, W, 3) float [0, 1]
 
         Returns:
             (N, 3, 224, 224) normalized for SigLIP
         """
         x = rgb.permute(0, 3, 1, 2)  # NHWC → NCHW
-        x = F.interpolate(x, size=(self._img_size, self._img_size), mode="bilinear", align_corners=False)
+        if x.shape[-1] != self._img_size or x.shape[-2] != self._img_size:
+            x = F.interpolate(x, size=(self._img_size, self._img_size), mode="bilinear", align_corners=False)
         x = (x - 0.5) / 0.5  # SigLIP uses [-1, 1] normalization
         return x.to(self._dtype)
 
@@ -547,24 +548,26 @@ class HierarchicalVLAActor(nn.Module):
         for p in self.paligemma.parameters():
             p.requires_grad = False
 
-        # 2. Attention-based waypoint head
-        # Input: PaliGemma token sequence (B, seq_len, 2048) split into image tokens (first 256)
-        # and text tokens (remaining). Text tokens attend over image tokens via cross-attention,
-        # producing a command-conditioned scene summary.
+        # 2. Cross-attention head: text tokens attend over image tokens
+        # Input: PaliGemma token sequence (B, seq_len, 2048) with first 256 as image tokens
+        # and remaining as text tokens. Text attends over image for command-conditioned scene summary.
         self._num_image_tokens = 256
         embed_dim = 256
         self.image_proj = nn.Linear(PaliGemmaFeatureExtractor.FEATURE_DIM, embed_dim)
         self.text_proj = nn.Linear(PaliGemmaFeatureExtractor.FEATURE_DIM, embed_dim)
         self.cross_attn = nn.MultiheadAttention(
-            embed_dim=embed_dim, num_heads=4, batch_first=True
+            embed_dim=embed_dim, num_heads=8, batch_first=True
         )
         self.target_mlp = nn.Sequential(
             nn.Linear(embed_dim + 9, 128),
             nn.ELU(),
-            nn.Linear(128, 3),
+            nn.Linear(128, 64),
+            nn.ELU(),
+            nn.Linear(64, 3),
         )
-        # Zero-init final layer so the drone starts by hovering
-        nn.init.zeros_(self.target_mlp[-1].weight)
+        # Small random init on final layer — avoids zero-init hovering trap
+        # while keeping initial outputs small (aux loss will bootstrap quickly)
+        nn.init.uniform_(self.target_mlp[-1].weight, -0.01, 0.01)
         nn.init.zeros_(self.target_mlp[-1].bias)
 
         # 3. Frozen waypoint nav policy (loaded from checkpoint)
@@ -634,13 +637,15 @@ class HierarchicalVLAActor(nn.Module):
 
         # Concat with flight state → predict target
         head_input = torch.cat([scene_summary, flight_state], dim=-1)
-        target_body = torch.tanh(self.target_mlp(head_input)) * self.target_range  # (B, 3)
+        target_logits = self.target_mlp(head_input)                     # (B, 3) pre-tanh
+        target_body = torch.tanh(target_logits) * self.target_range     # (B, 3) bounded
+        self._last_target_logits = target_logits  # stash pre-tanh for aux loss (avoids tanh saturation)
         return target_body
 
     def forward(self, obs: dict[str, torch.Tensor], masks=None, hidden_state=None, stochastic_output: bool = False) -> torch.Tensor:
-        # 1. Get PaliGemma token sequence (frozen, no grad)
+        # 1. PaliGemma token features (frozen, no grad) — use cached if available
         if "vla_token_features" in obs and obs["vla_token_features"].abs().sum() > 0:
-            token_features = obs["vla_token_features"].float()  # fp16 cache → fp32
+            token_features = obs["vla_token_features"].float()  # fp16 → fp32
         else:
             rgb = obs["rgb"]
             text_tokens = obs["text_tokens"].long()
@@ -651,10 +656,16 @@ class HierarchicalVLAActor(nn.Module):
         flight_state = obs["policy"]  # (B, 9)
         text_mask = obs["text_mask"]  # (B, seq_len)
         target_body = self._compute_target_from_tokens(token_features, text_mask, flight_state)
-        self._last_target = target_body  # for auxiliary loss
+        self._last_target_body = target_body  # stash for auxiliary supervision loss
+
+        # (hold override removed — conflicted with zero-init head. Rely on
+        # PPO + attention to learn target offsets directly.)
 
         # 3. Build 15-dim observation for waypoint policy
-        wp_obs = torch.cat([flight_state, target_body, target_body], dim=-1)  # (B, 15)
+        # Slots: [flight_state(9), target_pos_b(3), pos_error_w(3)]
+        # pos_error_w comes from env (world-frame error), matching waypoint training format
+        pos_error_w = obs["pos_error_w"]  # (B, 3)
+        wp_obs = torch.cat([flight_state, target_body.detach(), pos_error_w], dim=-1)  # (B, 15)
 
         # 4. Run frozen waypoint policy
         action_mean = self._waypoint_policy_forward(wp_obs)
@@ -713,7 +724,7 @@ class HierarchicalVLACritic(nn.Module):
         self._shared_paligemma: PaliGemmaFeatureExtractor | None = None
 
     def forward(self, obs: dict[str, torch.Tensor], masks=None, hidden_state=None, stochastic_output: bool = False) -> torch.Tensor:
-        # Use token-level features (shared with actor cache) then pool
+        # Use token features (shared with actor via cache), then mean-pool for value estimation
         if "vla_token_features" in obs and obs["vla_token_features"].abs().sum() > 0:
             token_features = obs["vla_token_features"].float()  # (B, seq_len, 2048)
         else:
@@ -723,8 +734,8 @@ class HierarchicalVLACritic(nn.Module):
             text_mask = obs["text_mask"].long()
             token_features = self._shared_paligemma.get_token_features(rgb, text_tokens, text_mask)
 
-        # Pool token features for critic (simple mean over non-padded tokens)
-        text_mask = obs["text_mask"]  # (B, seq_len)
+        # Mean-pool over sequence for critic (simple scalar scene summary)
+        text_mask = obs["text_mask"]
         mask = text_mask.unsqueeze(-1).to(token_features.dtype)
         vla_features = (token_features * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
 

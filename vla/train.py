@@ -35,6 +35,7 @@ from datetime import datetime
 import gymnasium as gym
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from tensordict import TensorDict
 from rsl_rl.algorithms import PPO
 
@@ -104,6 +105,158 @@ class VLAPolicy(nn.Module):
         return None
 
 
+def compute_aux_weight(iteration: int, cfg) -> float:
+    """Anneal auxiliary target supervision weight over training.
+
+    Schedule: full weight → linear decay → residual floor.
+    """
+    if iteration < cfg.aux_warmup_end:
+        return cfg.aux_loss_weight
+    elif iteration < cfg.aux_decay_end:
+        progress = (iteration - cfg.aux_warmup_end) / (cfg.aux_decay_end - cfg.aux_warmup_end)
+        return cfg.aux_loss_weight - progress * (cfg.aux_loss_weight - cfg.aux_min_weight)
+    else:
+        return cfg.aux_min_weight
+
+
+def ppo_update_with_aux(ppo, policy, aux_weight: float, aux_optimizer=None) -> dict[str, float]:
+    """PPO update with auxiliary target supervision loss on the cross-attention head."""
+    mean_value_loss = 0.0
+    mean_surrogate_loss = 0.0
+    mean_entropy = 0.0
+    mean_aux_loss = 0.0
+    mean_target_l2_error = 0.0
+    mean_err_x = 0.0
+    mean_err_y = 0.0
+    mean_err_z = 0.0
+    mean_gt_dist = 0.0  # how far away the GT target actually is
+
+    generator = ppo.storage.mini_batch_generator(ppo.num_mini_batches, ppo.num_learning_epochs)
+
+    for (
+        obs_batch,
+        actions_batch,
+        target_values_batch,
+        advantages_batch,
+        returns_batch,
+        old_actions_log_prob_batch,
+        old_mu_batch,
+        old_sigma_batch,
+        hidden_states_batch,
+        masks_batch,
+    ) in generator:
+        original_batch_size = obs_batch.batch_size[0]
+
+        # Recompute actions/values for current policy params
+        policy.act(obs_batch, masks=masks_batch, hidden_state=hidden_states_batch[0])
+        actions_log_prob_batch = policy.get_actions_log_prob(actions_batch)
+        value_batch = policy.evaluate(obs_batch, masks=masks_batch, hidden_state=hidden_states_batch[1])
+        mu_batch = policy.action_mean[:original_batch_size]
+        sigma_batch = policy.action_std[:original_batch_size]
+        entropy_batch = policy.entropy[:original_batch_size]
+
+        # Adaptive LR
+        if ppo.desired_kl is not None and ppo.schedule == "adaptive":
+            with torch.inference_mode():
+                kl = torch.sum(
+                    torch.log(sigma_batch / old_sigma_batch + 1e-5)
+                    + (old_sigma_batch.square() + (old_mu_batch - mu_batch).square())
+                    / (2.0 * sigma_batch.square())
+                    - 0.5,
+                    axis=-1,
+                )
+                kl_mean = kl.mean()
+                if kl_mean > ppo.desired_kl * 2.0:
+                    ppo.learning_rate = max(1e-5, ppo.learning_rate / 1.5)
+                elif kl_mean < ppo.desired_kl / 2.0 and kl_mean > 0.0:
+                    ppo.learning_rate = min(1e-2, ppo.learning_rate * 1.5)
+                for pg in ppo.optimizer.param_groups:
+                    pg["lr"] = ppo.learning_rate
+
+        # Surrogate loss
+        ratio = torch.exp(actions_log_prob_batch - old_actions_log_prob_batch.squeeze())
+        surrogate = -advantages_batch.squeeze() * ratio
+        surrogate_clipped = -advantages_batch.squeeze() * ratio.clamp(
+            1.0 - ppo.clip_param, 1.0 + ppo.clip_param
+        )
+        surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+
+        # Value loss
+        if ppo.use_clipped_value_loss:
+            value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
+                -ppo.clip_param, ppo.clip_param
+            )
+            value_losses = (value_batch - returns_batch).pow(2)
+            value_losses_clipped = (value_clipped - returns_batch).pow(2)
+            value_loss = torch.max(value_losses, value_losses_clipped).mean()
+        else:
+            value_loss = (returns_batch - value_batch).pow(2).mean()
+
+        # Auxiliary target supervision loss (computed in pre-tanh space to avoid saturation)
+        predicted_logits = policy.actor._last_target_logits  # (B, 3) pre-tanh, has grad_fn
+        gt_target = obs_batch["target_gt_body"]              # (B, 3) body-frame ground truth
+        # Convert ground truth to pre-tanh space: atanh(gt / target_range), clamped to avoid inf
+        gt_normalized = (gt_target / policy.actor.target_range).clamp(-0.999, 0.999)
+        gt_logits = torch.atanh(gt_normalized)
+        aux_loss = F.mse_loss(predicted_logits, gt_logits)
+
+        # PPO loss (critic + std_param; cross-attention head is detached from surrogate)
+        ppo_loss = (
+            surrogate_loss
+            + ppo.value_loss_coef * value_loss
+            - ppo.entropy_coef * entropy_batch.mean()
+        )
+
+        # Two separate optimizer steps so PPO's adaptive LR doesn't throttle aux learning
+        ppo.optimizer.zero_grad()
+        if aux_optimizer is not None:
+            aux_optimizer.zero_grad()
+            ppo_loss.backward()
+            nn.utils.clip_grad_norm_(policy.parameters(), ppo.max_grad_norm)
+            ppo.optimizer.step()
+            # Aux step: separate optimizer with faster LR for cross-attention head
+            (aux_weight * aux_loss).backward()
+            aux_optimizer.step()
+        else:
+            # Fallback: single optimizer (original behavior)
+            loss = ppo_loss + aux_weight * aux_loss
+            loss.backward()
+            nn.utils.clip_grad_norm_(policy.parameters(), ppo.max_grad_norm)
+            ppo.optimizer.step()
+
+        # Diagnostic: per-axis and L2 error between predicted and GT target
+        with torch.no_grad():
+            predicted_target = policy.actor._last_target_body  # (B, 3) post-tanh
+            err = predicted_target - gt_target                  # (B, 3)
+            target_l2 = err.norm(dim=-1).mean()
+            axis_err = err.abs().mean(dim=0)                    # (3,) mean absolute error per axis
+
+        mean_value_loss += value_loss.item()
+        mean_surrogate_loss += surrogate_loss.item()
+        mean_entropy += entropy_batch.mean().item()
+        mean_aux_loss += aux_loss.item()
+        mean_target_l2_error += target_l2.item()
+        mean_err_x += axis_err[0].item()
+        mean_err_y += axis_err[1].item()
+        mean_err_z += axis_err[2].item()
+        mean_gt_dist += gt_target.norm(dim=-1).mean().item()
+
+    num_updates = ppo.num_learning_epochs * ppo.num_mini_batches
+    ppo.storage.clear()
+
+    return {
+        "value_function": mean_value_loss / num_updates,
+        "surrogate": mean_surrogate_loss / num_updates,
+        "entropy": mean_entropy / num_updates,
+        "aux_target_mse": mean_aux_loss / num_updates,
+        "target_l2_error_m": mean_target_l2_error / num_updates,
+        "target_err_x": mean_err_x / num_updates,
+        "target_err_y": mean_err_y / num_updates,
+        "target_err_z": mean_err_z / num_updates,
+        "gt_target_dist_m": mean_gt_dist / num_updates,
+    }
+
+
 def main():
     env_cfg = VLADroneEnvCfg()
     env_cfg.scene.num_envs = args_cli.num_envs
@@ -136,7 +289,7 @@ def main():
         waypoint_checkpoint_path=waypoint_ckpt,
         paligemma_model_name="google/paligemma-3b-pt-224",
         init_std=0.3,
-        target_range=1.5,
+        target_range=3.0,  # needs to cover full arena diagonal (~2.5m)
     ).to(device)
 
     print("[INFO] Constructing Hierarchical VLA critic...")
@@ -159,20 +312,23 @@ def main():
 
     ppo = PPO(policy=policy, device=device, **alg_cfg)
 
-    # Only train non-PaliGemma, non-frozen-waypoint-buffer params
-    trainable_params = [p for name, p in policy.named_parameters() if p.requires_grad]
-    ppo.optimizer = torch.optim.Adam(trainable_params, lr=alg_cfg["learning_rate"])
-    print(f"[INFO] PPO optimizer: {sum(p.numel() for p in trainable_params):,} trainable params")
-
-    # Separate optimizer for aux loss — only trains actor's attention head params
-    # (text_proj, image_proj, cross_attn, target_mlp). Uses higher LR since it's
-    # a supervised regression signal.
-    actor_head_params = [
-        p for name, p in actor.named_parameters()
-        if p.requires_grad and any(k in name for k in ["text_proj", "image_proj", "cross_attn", "target_mlp"])
-    ]
-    aux_optimizer = torch.optim.Adam(actor_head_params, lr=1e-4)
-    print(f"[INFO] Aux optimizer: {sum(p.numel() for p in actor_head_params):,} attention head params")
+    # PPO optimizer: critic + std_param only (cross-attention head trained by aux optimizer)
+    ppo_param_names = set()
+    ppo_params = []
+    aux_params = []
+    for name, p in policy.named_parameters():
+        if not p.requires_grad:
+            continue
+        # Cross-attention head params go to aux optimizer
+        if any(k in name for k in ["image_proj", "text_proj", "cross_attn", "target_mlp"]):
+            aux_params.append(p)
+        else:
+            ppo_params.append(p)
+            ppo_param_names.add(name)
+    ppo.optimizer = torch.optim.Adam(ppo_params, lr=alg_cfg["learning_rate"])
+    aux_optimizer = torch.optim.Adam(aux_params, lr=3e-4)  # faster LR for direct supervision
+    print(f"[INFO] PPO optimizer: {sum(p.numel() for p in ppo_params):,} params (critic + std)")
+    print(f"[INFO] Aux optimizer: {sum(p.numel() for p in aux_params):,} params (cross-attention head) @ lr=3e-4")
 
     # Resume from checkpoint if provided
     if args_cli.resume_path:
@@ -231,7 +387,7 @@ def main():
         with torch.inference_mode():
             for _ in range(num_steps_per_env):
                 actions = ppo.act(obs)
-                # Stash token features into rollout buffer so PPO update skips PaliGemma
+                # Stash PaliGemma token features (fp16) so PPO replay skips the 3B model
                 cached = policy.actor.paligemma._cache_val
                 if cached is not None:
                     ppo.transition.observations["vla_token_features"] = cached.detach().half()
@@ -249,38 +405,10 @@ def main():
                 cur_reward_sum[new_ids] = 0
                 cur_episode_length[new_ids] = 0
 
-        # -- Auxiliary supervised loss: predict ground-truth target from PaliGemma features --
-        # Runs BEFORE PPO update, so PPO starts from a head that knows where targets are.
-        # Uses SEPARATE optimizer so PPO gradients don't overwhelm the aux signal.
-        import torch.nn.functional as F_aux
-        storage = ppo.storage
-        flat_obs = storage.observations.flatten(0, 1)
-        total_samples = flat_obs.batch_size[0]
-
-        # Train aux loss on multiple mini-batches (like PPO epochs) for balance
-        aux_losses = []
-        for _ in range(4):  # 4 aux gradient steps per iteration
-            aux_idx = torch.randint(0, total_samples, (64,), device=device)
-            aux_gt = flat_obs["target_gt_body"][aux_idx]
-            token_features = flat_obs["vla_token_features"][aux_idx].float()
-            text_mask = flat_obs["text_mask"][aux_idx]
-            flight_state = flat_obs["policy"][aux_idx]
-
-            aux_optimizer.zero_grad()
-            target_pred = actor._compute_target_from_tokens(
-                token_features, text_mask, flight_state
-            )
-            aux_loss = F_aux.mse_loss(target_pred, aux_gt)
-            aux_loss.backward()
-            torch.nn.utils.clip_grad_norm_(actor_head_params, 1.0)
-            aux_optimizer.step()
-            aux_losses.append(aux_loss.item())
-        actor.paligemma.clear_cache()
-
-        # -- PPO Update --
+        # -- PPO Update with auxiliary target supervision --
         ppo.compute_returns(obs)
-        loss_dict = ppo.update()
-        loss_dict["aux_target_mse"] = sum(aux_losses) / len(aux_losses)
+        aux_weight = compute_aux_weight(it, agent_cfg)
+        loss_dict = ppo_update_with_aux(ppo, policy, aux_weight, aux_optimizer)
 
         stop = time.time()
 
@@ -300,6 +428,7 @@ def main():
         writer.add_scalar("Train/mean_reward", mean_reward, it)
         writer.add_scalar("Train/mean_episode_length", mean_ep_len, it)
         writer.add_scalar("Train/fps", fps, it)
+        writer.add_scalar("Curriculum/aux_weight", aux_weight, it)
         for k, v in loss_dict.items():
             writer.add_scalar(f"Loss/{k}", v, it)
 
@@ -310,11 +439,25 @@ def main():
                 writer.add_scalar(f"Env/{k}", val, it)
 
         if it % 10 == 0:
+            # Extract key env diagnostics for console
+            log = extras.get("log", {})
+            succ_rate = log.get("Termination/success_rate", 0)
+            wrong_rate = log.get("Termination/wrong_object_rate", 0)
+            final_dist = log.get("Diagnostic/final_dist_to_target", 0)
+            succ_rate = succ_rate.item() if hasattr(succ_rate, "item") else succ_rate
+            wrong_rate = wrong_rate.item() if hasattr(wrong_rate, "item") else wrong_rate
+            final_dist = final_dist.item() if hasattr(final_dist, "item") else final_dist
+
+            ex = loss_dict.get('target_err_x', 0)
+            ey = loss_dict.get('target_err_y', 0)
+            ez = loss_dict.get('target_err_z', 0)
+            gt_d = loss_dict.get('gt_target_dist_m', 0)
             print(
                 f"[{it:5d}/{max_iterations}]  reward={mean_reward:7.2f}  "
                 f"ep_len={mean_ep_len:6.1f}  fps={fps:7.0f}  "
-                f"surr={loss_dict.get('surrogate', 0):.4f}  val={loss_dict.get('value_function', 0):.4f}  "
-                f"aux={loss_dict.get('aux_target_mse', 0):.3f}"
+                f"aux={loss_dict.get('aux_target_mse', 0):.4f}  tgt_err={loss_dict.get('target_l2_error_m', 0):.3f}m  "
+                f"err_xyz=({ex:.2f},{ey:.2f},{ez:.2f})  gt_dist={gt_d:.2f}m  "
+                f"succ={succ_rate:.0%}  wrong={wrong_rate:.0%}  dist={final_dist:.2f}m"
             )
 
         # -- Save --

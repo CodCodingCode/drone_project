@@ -8,8 +8,7 @@ class VLADronePPORunnerCfg(RslRlOnPolicyRunnerCfg):
     max_iterations = 5000
     save_interval = 100
     experiment_name = "vla_drone_direct"
-    logger = "wandb"
-    wandb_project = "drone-vla"
+    logger = "tensorboard"
 
     # NOTE: actor and critic are custom nn.Modules, not standard RslRl models.
     # They are constructed manually in train.py, not via construct_algorithm.
@@ -22,6 +21,12 @@ class VLADronePPORunnerCfg(RslRlOnPolicyRunnerCfg):
         actor_obs_normalization=True,
         critic_obs_normalization=True,
     )
+
+    # Auxiliary target supervision (MSE on cross-attention head's predicted target vs ground truth)
+    aux_loss_weight: float = 5.0       # initial/peak MSE weight (high because head is detached from PPO)
+    aux_warmup_end: int = 500          # full weight until this iteration
+    aux_decay_end: int = 2000          # linear decay to aux_min_weight
+    aux_min_weight: float = 0.1        # residual weight after decay (prevents drift)
 
     # LoRA fine-tuning
     lora_learning_rate: float = 1.0e-6
@@ -37,10 +42,10 @@ class VLADronePPORunnerCfg(RslRlOnPolicyRunnerCfg):
         entropy_coef=0.005,
         num_learning_epochs=5,
         num_mini_batches=4,
-        learning_rate=3.0e-5,
+        learning_rate=1.0e-5,
         schedule="adaptive",
         gamma=0.99,
         lam=0.95,
-        desired_kl=0.01,
+        desired_kl=0.005,
         max_grad_norm=1.0,
     )
