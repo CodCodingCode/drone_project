@@ -57,7 +57,7 @@ class VLAPolicy(nn.Module):
 
     is_recurrent = False
 
-    def __init__(self, actor: VLAActorModel, critic: VLACriticModel):
+    def __init__(self, actor, critic):
         super().__init__()
         self.actor = actor
         self.critic = critic
@@ -65,13 +65,18 @@ class VLAPolicy(nn.Module):
     def _obs_dict(self, obs: TensorDict) -> dict:
         return {k: obs[k] for k in obs.keys()}
 
-    def act(self, obs: TensorDict, **kwargs) -> torch.Tensor:
+    def act(self, obs: TensorDict, masks=None, hidden_state=None, **kwargs) -> torch.Tensor:
         d = self._obs_dict(obs)
-        return self.actor(d, stochastic_output=True)
+        return self.actor(d, masks=masks, hidden_state=hidden_state, stochastic_output=True)
 
-    def evaluate(self, obs: TensorDict, **kwargs) -> torch.Tensor:
+    def evaluate(self, obs: TensorDict, masks=None, hidden_state=None, **kwargs) -> torch.Tensor:
+        # Pass actor's cached scene features to critic (avoids re-running PaliGemma on 4 views)
+        if hasattr(self.actor, '_critic_features') and self.actor._critic_features is not None:
+            self.critic._cached_scene_features = self.actor._critic_features
         d = self._obs_dict(obs)
-        return self.critic(d)
+        result = self.critic(d, masks=masks, hidden_state=hidden_state)
+        self.critic._cached_scene_features = None  # clear after use
+        return result
 
     def get_actions_log_prob(self, actions: torch.Tensor) -> torch.Tensor:
         return self.actor.get_output_log_prob(actions)
@@ -94,8 +99,8 @@ class VLAPolicy(nn.Module):
         self.critic.update_normalization(d)
 
     def reset(self, dones=None):
-        self.actor.reset()
-        self.critic.reset()
+        self.actor.reset(dones)
+        self.critic.reset(dones)
 
     def act_inference(self, obs: TensorDict, **kwargs) -> torch.Tensor:
         d = self._obs_dict(obs)
@@ -125,6 +130,8 @@ def ppo_update_with_aux(ppo, policy, aux_weight: float, aux_optimizer=None) -> d
     mean_surrogate_loss = 0.0
     mean_entropy = 0.0
     mean_aux_loss = 0.0
+    mean_cls_loss = 0.0
+    mean_cls_accuracy = 0.0
     mean_target_l2_error = 0.0
     mean_err_x = 0.0
     mean_err_y = 0.0
@@ -193,12 +200,21 @@ def ppo_update_with_aux(ppo, policy, aux_weight: float, aux_optimizer=None) -> d
             value_loss = (returns_batch - value_batch).pow(2).mean()
 
         # Auxiliary target supervision loss (computed in pre-tanh space to avoid saturation)
-        predicted_logits = policy.actor._last_target_logits  # (B, 3) pre-tanh, has grad_fn
-        gt_target = obs_batch["target_gt_body"]              # (B, 3) body-frame ground truth
+        predicted_logits = policy.actor._last_target_logits  # (N, 3) pre-tanh, has grad_fn
+        gt_target = obs_batch["target_gt_body"]              # ground truth (may be padded in recurrent mode)
+        obj_target_raw = obs_batch["target_obj_idx"]         # object class (may be padded)
+
+        obj_logits = policy.actor._last_obj_logits
+
         # Convert ground truth to pre-tanh space: atanh(gt / target_range), clamped to avoid inf
         gt_normalized = (gt_target / policy.actor.target_range).clamp(-0.999, 0.999)
         gt_logits = torch.atanh(gt_normalized)
         aux_loss = F.mse_loss(predicted_logits, gt_logits)
+
+        # Object classification loss (which of 3 objects does the command refer to?)
+        obj_target = obj_target_raw.long()                   # (N,) class indices
+        cls_loss = F.cross_entropy(obj_logits, obj_target)
+        combined_aux_loss = aux_loss + cls_loss
 
         # PPO loss (critic + std_param; cross-attention head is detached from surrogate)
         ppo_loss = (
@@ -214,12 +230,12 @@ def ppo_update_with_aux(ppo, policy, aux_weight: float, aux_optimizer=None) -> d
             ppo_loss.backward()
             nn.utils.clip_grad_norm_(policy.parameters(), ppo.max_grad_norm)
             ppo.optimizer.step()
-            # Aux step: separate optimizer with faster LR for cross-attention head
-            (aux_weight * aux_loss).backward()
+            # Aux step: position MSE + object classification CE
+            (aux_weight * combined_aux_loss).backward()
             aux_optimizer.step()
         else:
             # Fallback: single optimizer (original behavior)
-            loss = ppo_loss + aux_weight * aux_loss
+            loss = ppo_loss + aux_weight * combined_aux_loss
             loss.backward()
             nn.utils.clip_grad_norm_(policy.parameters(), ppo.max_grad_norm)
             ppo.optimizer.step()
@@ -231,10 +247,17 @@ def ppo_update_with_aux(ppo, policy, aux_weight: float, aux_optimizer=None) -> d
             target_l2 = err.norm(dim=-1).mean()
             axis_err = err.abs().mean(dim=0)                    # (3,) mean absolute error per axis
 
+        # Classification accuracy
+        with torch.no_grad():
+            obj_pred = obj_logits.argmax(dim=-1)
+            cls_acc = (obj_pred == obj_target).float().mean()
+
         mean_value_loss += value_loss.item()
         mean_surrogate_loss += surrogate_loss.item()
         mean_entropy += entropy_batch.mean().item()
         mean_aux_loss += aux_loss.item()
+        mean_cls_loss += cls_loss.item()
+        mean_cls_accuracy += cls_acc.item()
         mean_target_l2_error += target_l2.item()
         mean_err_x += axis_err[0].item()
         mean_err_y += axis_err[1].item()
@@ -249,6 +272,8 @@ def ppo_update_with_aux(ppo, policy, aux_weight: float, aux_optimizer=None) -> d
         "surrogate": mean_surrogate_loss / num_updates,
         "entropy": mean_entropy / num_updates,
         "aux_target_mse": mean_aux_loss / num_updates,
+        "cls_loss": mean_cls_loss / num_updates,
+        "cls_accuracy": mean_cls_accuracy / num_updates,
         "target_l2_error_m": mean_target_l2_error / num_updates,
         "target_err_x": mean_err_x / num_updates,
         "target_err_y": mean_err_y / num_updates,
@@ -290,10 +315,14 @@ def main():
         paligemma_model_name="google/paligemma-3b-pt-224",
         init_std=0.3,
         target_range=3.0,  # needs to cover full arena diagonal (~2.5m)
+        lstm_hidden_dim=agent_cfg.lstm_hidden_dim,
     ).to(device)
 
     print("[INFO] Constructing Hierarchical VLA critic...")
-    critic = HierarchicalVLACritic(flight_state_dim=9).to(device)
+    critic = HierarchicalVLACritic(
+        flight_state_dim=9,
+        lstm_hidden_dim=agent_cfg.lstm_hidden_dim,
+    ).to(device)
     critic._shared_paligemma = actor.paligemma
     print("[INFO] Linked shared PaliGemma backbone between actor and critic.")
 
@@ -320,7 +349,7 @@ def main():
         if not p.requires_grad:
             continue
         # Cross-attention head params go to aux optimizer
-        if any(k in name for k in ["image_proj", "text_proj", "cross_attn", "target_mlp"]):
+        if any(k in name for k in ["image_proj", "text_proj", "cross_attn", "target_mlp", "obj_classifier", "actor.lstm"]):
             aux_params.append(p)
         else:
             ppo_params.append(p)
@@ -384,7 +413,7 @@ def main():
         start = time.time()
 
         # -- Rollout --
-        with torch.inference_mode():
+        with torch.no_grad():  # no_grad (not inference_mode) for LSTM hidden state compatibility
             for _ in range(num_steps_per_env):
                 actions = ppo.act(obs)
                 # Stash PaliGemma token features (fp16) so PPO replay skips the 3B model
@@ -406,6 +435,8 @@ def main():
                 cur_episode_length[new_ids] = 0
 
         # -- PPO Update with auxiliary target supervision --
+        # Clone obs to escape inference_mode (LSTM needs autograd-compatible tensors)
+        obs = obs.clone()
         ppo.compute_returns(obs)
         aux_weight = compute_aux_weight(it, agent_cfg)
         loss_dict = ppo_update_with_aux(ppo, policy, aux_weight, aux_optimizer)
@@ -452,10 +483,12 @@ def main():
             ey = loss_dict.get('target_err_y', 0)
             ez = loss_dict.get('target_err_z', 0)
             gt_d = loss_dict.get('gt_target_dist_m', 0)
+            cls_acc = loss_dict.get('cls_accuracy', 0)
             print(
                 f"[{it:5d}/{max_iterations}]  reward={mean_reward:7.2f}  "
                 f"ep_len={mean_ep_len:6.1f}  fps={fps:7.0f}  "
                 f"aux={loss_dict.get('aux_target_mse', 0):.4f}  tgt_err={loss_dict.get('target_l2_error_m', 0):.3f}m  "
+                f"cls_acc={cls_acc:.0%}  "
                 f"err_xyz=({ex:.2f},{ey:.2f},{ez:.2f})  gt_dist={gt_d:.2f}m  "
                 f"succ={succ_rate:.0%}  wrong={wrong_rate:.0%}  dist={final_dist:.2f}m"
             )

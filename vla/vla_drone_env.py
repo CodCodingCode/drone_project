@@ -6,7 +6,7 @@ PaliGemma processes these inside the policy network (vla_policy.py).
 
 Observation (multi-group dict):
   "policy"      (N, 9)         flight state
-  "rgb"         (N, 224, 224, 3) raw camera image [0, 1] float
+  "rgb"         (N, 4, 224, 224, 3) 4-camera RGB [0, 1] float (front/right/back/left)
   "text_tokens" (N, 32)        tokenized text command IDs
   "text_mask"   (N, 32)        attention mask
 """
@@ -94,24 +94,47 @@ class VLADroneEnvCfg(DirectRLEnvCfg):
     thrust_to_weight = 1.9
     moment_scale = 0.01
 
-    # Onboard camera (224x224 RGB — PaliGemma's native resolution, no upscaling needed)
-    tiled_camera: TiledCameraCfg = TiledCameraCfg(
-        prim_path="/World/envs/env_.*/Camera",
+    # 4 onboard cameras (front/right/back/left) for 360° coverage
+    # Each 90° FOV, 224x224 RGB + depth
+    _cam_spawn = sim_utils.PinholeCameraCfg(
+        focal_length=10.0,       # shorter focal length → wider FOV
+        focus_distance=100.0,
+        horizontal_aperture=20.0,  # ~90° FOV: 2*atan(20/(2*10)) ≈ 90°
+        clipping_range=(0.01, 20.0),
+    )
+    # Front camera: looks along +X body axis (default drone forward)
+    # Isaac camera convention: -Z is view direction, +Y is up
+    # rot (0.5, 0.5, -0.5, -0.5) maps camera -Z → body +X (forward)
+    cam_front: TiledCameraCfg = TiledCameraCfg(
+        prim_path="/World/envs/env_.*/CamFront",
         offset=TiledCameraCfg.OffsetCfg(pos=(0.0, 0.0, 0.0), rot=(0.5, 0.5, -0.5, -0.5), convention="world"),
-        data_types=["rgb"],
-        spawn=sim_utils.PinholeCameraCfg(
-            focal_length=16.0,
-            focus_distance=100.0,
-            horizontal_aperture=15.0,
-            clipping_range=(0.01, 20.0),
-        ),
-        width=224,
-        height=224,
+        data_types=["rgb", "distance_to_camera"], spawn=_cam_spawn, width=224, height=224,
+    )
+    # Right camera: looks along +Y body axis (90° CW from front)
+    # rot that maps camera -Z → body +Y
+    cam_right: TiledCameraCfg = TiledCameraCfg(
+        prim_path="/World/envs/env_.*/CamRight",
+        offset=TiledCameraCfg.OffsetCfg(pos=(0.0, 0.0, 0.0), rot=(0.0, 0.707107, 0.0, -0.707107), convention="world"),
+        data_types=["rgb", "distance_to_camera"], spawn=_cam_spawn, width=224, height=224,
+    )
+    # Back camera: looks along -X body axis (180° from front)
+    # rot that maps camera -Z → body -X
+    cam_back: TiledCameraCfg = TiledCameraCfg(
+        prim_path="/World/envs/env_.*/CamBack",
+        offset=TiledCameraCfg.OffsetCfg(pos=(0.0, 0.0, 0.0), rot=(0.5, -0.5, 0.5, 0.5), convention="world"),
+        data_types=["rgb", "distance_to_camera"], spawn=_cam_spawn, width=224, height=224,
+    )
+    # Left camera: looks along -Y body axis (270° from front)
+    # rot that maps camera -Z → body -Y
+    cam_left: TiledCameraCfg = TiledCameraCfg(
+        prim_path="/World/envs/env_.*/CamLeft",
+        offset=TiledCameraCfg.OffsetCfg(pos=(0.0, 0.0, 0.0), rot=(0.0, 0.707107, 0.0, 0.707107), convention="world"),
+        data_types=["rgb", "distance_to_camera"], spawn=_cam_spawn, width=224, height=224,
     )
     camera_body_offset_pos = (0.05, 0.0, 0.01)
 
     # How often to grab camera frames (every N physics steps)
-    camera_every_n = 4  # every 4 steps (80ms gap) — trade temporal freq for native-res spatial quality
+    camera_every_n = 4  # every 4 steps — 4 cameras so rendering is heavier
 
     # PaliGemma tokenizer name (lightweight, no model weights loaded in env)
     tokenizer_name = "google/paligemma-3b-pt-224"
@@ -174,8 +197,10 @@ class VLADroneEnv(DirectRLEnv):
         self._text_tokens = torch.zeros(self.num_envs, self.cfg.max_text_length, dtype=torch.long, device=self.device)
         self._text_mask = torch.zeros(self.num_envs, self.cfg.max_text_length, dtype=torch.long, device=self.device)
 
-        # Cached camera image (updated every N steps)
-        self._cached_rgb = torch.zeros(self.num_envs, 224, 224, 3, dtype=torch.float32, device=self.device)
+        # Cached camera images — 4 views (updated every N steps)
+        self._num_cameras = 4
+        self._cached_rgb = torch.zeros(self.num_envs, 4, 224, 224, 3, dtype=torch.float32, device=self.device)
+        self._cached_depth = torch.zeros(self.num_envs, 4, 224, 224, dtype=torch.float32, device=self.device)
         self._steps_since_capture = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
         # Dwell counter: consecutive steps inside hover zone with low speed
@@ -233,7 +258,13 @@ class VLADroneEnv(DirectRLEnv):
 
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot)
-        self._camera = TiledCamera(self.cfg.tiled_camera)
+        # 4 cameras for 360° coverage
+        self._cameras = [
+            TiledCamera(self.cfg.cam_front),
+            TiledCamera(self.cfg.cam_right),
+            TiledCamera(self.cfg.cam_back),
+            TiledCamera(self.cfg.cam_left),
+        ]
 
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
@@ -269,7 +300,8 @@ class VLADroneEnv(DirectRLEnv):
             self.scene.filter_collisions(global_prim_paths=[self.cfg.terrain.prim_path])
 
         self.scene.articulations["robot"] = self._robot
-        self.scene.sensors["tiled_camera"] = self._camera
+        for i, cam in enumerate(self._cameras):
+            self.scene.sensors[f"tiled_camera_{i}"] = cam
 
         light_cfg = sim_utils.DomeLightCfg(
             intensity=1500.0,
@@ -301,16 +333,22 @@ class VLADroneEnv(DirectRLEnv):
         drone_pos = self._robot.data.root_pos_w
         drone_quat = self._robot.data.root_quat_w
         cam_pos = drone_pos + quat_apply(drone_quat, self._cam_offset.expand(self.num_envs, -1))
-        # Compose drone orientation with camera offset: world_rot = drone_rot * cam_offset
-        cam_offset = self._cam_rot_offset.unsqueeze(0).expand(self.num_envs, -1)
-        cam_quat = quat_mul(drone_quat, cam_offset)
-        self._camera._view.set_world_poses(cam_pos, cam_quat)
+        # Each camera has its own rotation offset baked into the TiledCameraCfg.
+        # We compose drone orientation with each camera's offset.
+        for cam in self._cameras:
+            cam_rot_offset = torch.tensor(cam.cfg.offset.rot, dtype=torch.float32, device=self.device)
+            cam_offset_expanded = cam_rot_offset.unsqueeze(0).expand(self.num_envs, -1)
+            cam_quat = quat_mul(drone_quat, cam_offset_expanded)
+            cam._view.set_world_poses(cam_pos, cam_quat)
 
     def _maybe_capture_camera(self):
         self._steps_since_capture += 1
         if (self._steps_since_capture >= self.cfg.camera_every_n).any():
-            rgb = self._camera.data.output["rgb"][:, :, :, :3]  # (N, 224, 224, 3) uint8
-            self._cached_rgb = rgb.float() / 255.0  # → [0, 1]
+            for i, cam in enumerate(self._cameras):
+                rgb = cam.data.output["rgb"][:, :, :, :3]  # (N, 224, 224, 3)
+                self._cached_rgb[:, i] = rgb.float() / 255.0
+                depth = cam.data.output["distance_to_camera"]  # (N, 224, 224, 1)
+                self._cached_depth[:, i] = depth.squeeze(-1).clamp(0.0, 20.0) / 20.0
             self._steps_since_capture.zero_()
 
     # ------------------------------------------------------------------
@@ -390,12 +428,14 @@ class VLADroneEnv(DirectRLEnv):
 
         return {
             "policy": flight_state,              # (N, 9)
-            "rgb": self._cached_rgb,             # (N, 64, 64, 3) float [0,1]
+            "rgb": self._cached_rgb,             # (N, 4, 224, 224, 3) float [0,1] — 4 views
             "text_tokens": self._text_tokens,    # (N, 280) long
             "text_mask": self._text_mask,        # (N, 280) long
             "vla_token_features": torch.zeros(self.num_envs, self.cfg.max_text_length, 2048, dtype=torch.float16, device=self.device),  # placeholder, filled by train loop
             "target_gt_body": target_gt_body,    # (N, 3) ground-truth target in body frame for aux supervision
             "pos_error_w": pos_error_w,          # (N, 3) world-frame position error for frozen waypoint policy
+            "target_obj_idx": self._target_obj_idx.float(),  # (N,) object class — cast to long for CE loss
+            "depth": self._cached_depth,         # (N, 4, 224, 224) normalized depth [0, 1] — 4 views
         }
 
     # ------------------------------------------------------------------

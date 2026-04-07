@@ -28,6 +28,11 @@ class VLADronePPORunnerCfg(RslRlOnPolicyRunnerCfg):
     aux_decay_end: int = 2000          # linear decay to aux_min_weight
     aux_min_weight: float = 0.1        # residual weight after decay (prevents drift)
 
+    # LSTM temporal memory
+    lstm_hidden_dim: int = 128
+    lstm_num_layers: int = 1
+    lstm_type: str = "lstm"
+
     # LoRA fine-tuning
     lora_learning_rate: float = 1.0e-6
     lora_mini_batch_size: int = 4

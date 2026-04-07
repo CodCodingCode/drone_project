@@ -22,6 +22,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+# Note: NOT using rsl_rl Memory module — manual LSTM state management is simpler
+# for our multi-stage architecture (PaliGemma + cross-attn + LSTM + waypoint).
 
 
 # ---------------------------------------------------------------------------
@@ -535,9 +537,11 @@ class HierarchicalVLAActor(nn.Module):
         lora_alpha: float = 0.0,
         init_std: float = 0.3,
         target_range: float = 2.5,  # max |target_pos_b| output
+        lstm_hidden_dim: int = 128,
     ):
         super().__init__()
         self.target_range = target_range
+        self._lstm_hidden_dim = lstm_hidden_dim
 
         # 1. PaliGemma feature extractor (fully frozen — no LoRA)
         self.paligemma = PaliGemmaFeatureExtractor(
@@ -548,25 +552,67 @@ class HierarchicalVLAActor(nn.Module):
         for p in self.paligemma.parameters():
             p.requires_grad = False
 
-        # 2. Cross-attention head: text tokens attend over image tokens
-        # Input: PaliGemma token sequence (B, seq_len, 2048) with first 256 as image tokens
-        # and remaining as text tokens. Text attends over image for command-conditioned scene summary.
-        self._num_image_tokens = 256
+        # 2. Cross-attention head: text tokens attend over 4×256=1024 image tokens
+        # 4 cameras (front/right/back/left), each producing 256 image tokens
+        self._num_cameras = 4
+        self._num_image_tokens_per_cam = 256
+        self._num_image_tokens_total = self._num_cameras * self._num_image_tokens_per_cam  # 1024
         embed_dim = 256
         self.image_proj = nn.Linear(PaliGemmaFeatureExtractor.FEATURE_DIM, embed_dim)
         self.text_proj = nn.Linear(PaliGemmaFeatureExtractor.FEATURE_DIM, embed_dim)
+
+        # Positional encoding: 2D spatial (16x16 grid) + camera direction embedding
+        self._grid_size = 16
+        pos_enc_2d = self._build_2d_sinusoidal_encoding(self._grid_size, embed_dim)  # (256, embed_dim)
+        # Repeat for 4 cameras + add learned camera direction embedding
+        self.register_buffer("_image_pos_enc_2d", pos_enc_2d)  # (256, embed_dim)
+        self.camera_embed = nn.Embedding(4, embed_dim)  # learned: which camera (front/right/back/left)
+
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=embed_dim, num_heads=8, batch_first=True
         )
-        self.target_mlp = nn.Sequential(
-            nn.Linear(embed_dim + 9, 128),
+
+        # Patch grid coordinates for attention-weighted spatial readout (per camera, 256 each)
+        grid = self._grid_size
+        patch_rows = torch.arange(grid).repeat_interleave(grid).float() / (grid - 1)  # (256,)
+        patch_cols = torch.arange(grid).repeat(grid).float() / (grid - 1)              # (256,)
+        # Tile for 4 cameras → (1024,)
+        self.register_buffer("_patch_rows", patch_rows.repeat(4))
+        self.register_buffer("_patch_cols", patch_cols.repeat(4))
+        # Camera index for each of 1024 tokens (0=front, 1=right, 2=back, 3=left)
+        cam_ids = torch.arange(4).repeat_interleave(256)  # (1024,)
+        self.register_buffer("_patch_cam_ids", cam_ids)
+        # Object classification head: which of 3 objects does the command refer to?
+        # Branches from scene_summary — provides direct "wrong object" gradient to cross-attention.
+        self.obj_classifier = nn.Sequential(
+            nn.Linear(embed_dim, 64),
             nn.ELU(),
-            nn.Linear(128, 64),
+            nn.Linear(64, 3),  # 3 classes: cube=0, sphere=1, cylinder=2
+        )
+
+        # Depth pooling: 224x224 depth map → 16x16 → 256 per-patch depth values
+        self._depth_pool = nn.AvgPool2d(kernel_size=14, stride=14)  # 224/14 = 16
+
+        # LSTM temporal memory: accumulates spatial context across frames.
+        # Input: scene_summary(256) + attn_spatial(3: row,col,depth) + flight_state(9) = 268
+        # attn_spatial gives explicit WHERE from attention-weighted patch coordinates + depth.
+        self.lstm = nn.LSTM(
+            input_size=embed_dim + 3 + 9,  # scene_summary + attn_spatial + flight_state
+            hidden_size=lstm_hidden_dim,
+            num_layers=1,
+            batch_first=True,
+        )
+        # Hidden state maintained across steps during rollout, reset on episode done
+        self._lstm_h: torch.Tensor | None = None  # (1, num_envs, hidden)
+        self._lstm_c: torch.Tensor | None = None  # (1, num_envs, hidden)
+
+        # Target prediction MLP: reads LSTM output (temporal spatial memory)
+        self.target_mlp = nn.Sequential(
+            nn.Linear(lstm_hidden_dim, 64),
             nn.ELU(),
             nn.Linear(64, 3),
         )
-        # Small random init on final layer — avoids zero-init hovering trap
-        # while keeping initial outputs small (aux loss will bootstrap quickly)
+        # Small random init on final layer
         nn.init.uniform_(self.target_mlp[-1].weight, -0.01, 0.01)
         nn.init.zeros_(self.target_mlp[-1].bias)
 
@@ -582,6 +628,27 @@ class HierarchicalVLAActor(nn.Module):
         n_train = sum(p.numel() for p in self.parameters() if p.requires_grad)
         n_total = sum(p.numel() for p in self.parameters())
         print(f"[VLA-Hier] Trainable: {n_train:,} / Total: {n_total:,} ({100*n_train/n_total:.3f}%)")
+
+    @staticmethod
+    def _build_2d_sinusoidal_encoding(grid_size: int, embed_dim: int) -> torch.Tensor:
+        """2D sinusoidal positional encoding for a grid_size x grid_size patch grid."""
+        half = embed_dim // 2
+        positions = torch.arange(grid_size, dtype=torch.float32)
+        dim_indices = torch.arange(half // 2, dtype=torch.float32)
+        freqs = 1.0 / (10000.0 ** (2 * dim_indices / half))
+        # Row encoding (first half of dims)
+        row_idx = positions.unsqueeze(1) * freqs.unsqueeze(0)  # (G, half//2)
+        row_enc = torch.cat([row_idx.sin(), row_idx.cos()], dim=-1)  # (G, half)
+        # Col encoding (second half of dims)
+        col_idx = positions.unsqueeze(1) * freqs.unsqueeze(0)
+        col_enc = torch.cat([col_idx.sin(), col_idx.cos()], dim=-1)  # (G, half)
+        # Combine: patch (i,j) gets [row_enc[i], col_enc[j]]
+        pos = torch.zeros(grid_size * grid_size, embed_dim)
+        for i in range(grid_size):
+            for j in range(grid_size):
+                pos[i * grid_size + j, :half] = row_enc[i]
+                pos[i * grid_size + j, half:] = col_enc[j]
+        return pos
 
     def _build_waypoint_policy(self, ckpt_path: str):
         """Load waypoint nav policy weights as frozen buffers."""
@@ -604,70 +671,118 @@ class HierarchicalVLAActor(nn.Module):
         x = F.elu(F.linear(x, self.wp_w1, self.wp_b1))
         return F.linear(x, self.wp_w2, self.wp_b2)
 
-    def _compute_target_from_tokens(self, token_features: torch.Tensor, text_mask: torch.Tensor, flight_state: torch.Tensor) -> torch.Tensor:
-        """Attention-based target prediction from PaliGemma token sequence.
+    def _compute_scene_summary(self, all_image_tokens: torch.Tensor, text_tokens_feat: torch.Tensor, text_mask_only: torch.Tensor, patch_depths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Cross-attention scene summary + attention-weighted spatial coordinates.
 
         Args:
-            token_features: (B, seq_len, 2048)
-            text_mask: (B, seq_len)  — 1 for real tokens, 0 for padding
-            flight_state: (B, 9)
+            all_image_tokens: (B, 1024, 2048) — 4 cameras × 256 tokens each
+            text_tokens_feat: (B, text_len, 2048) — text token features
+            text_mask_only: (B, text_len) — text attention mask
+            patch_depths: (B, 1024) — per-patch depth values across all 4 cameras
 
         Returns:
-            target_body: (B, 3) in body frame, bounded by tanh * target_range
+            scene_summary: (B, embed_dim) — WHAT object (semantic)
+            attn_spatial: (B, 3) — WHERE: attention-weighted (row, col, depth)
         """
-        n_img = self._num_image_tokens  # 256
-        image_tokens = token_features[:, :n_img]       # (B, 256, 2048)
-        text_tokens = token_features[:, n_img:]        # (B, text_len, 2048)
-        text_mask_only = text_mask[:, n_img:]          # (B, text_len)
+        B = all_image_tokens.shape[0]
 
-        image_emb = self.image_proj(image_tokens)      # (B, 256, embed_dim)
-        text_emb = self.text_proj(text_tokens)         # (B, text_len, embed_dim)
+        # Project image tokens and add positional + camera embeddings
+        image_emb = self.image_proj(all_image_tokens)  # (B, 1024, embed_dim)
+        # Add 2D spatial encoding (same pattern repeated 4 times)
+        pos_enc = self._image_pos_enc_2d.repeat(self._num_cameras, 1)  # (1024, embed_dim)
+        image_emb = image_emb + pos_enc
+        # Add camera direction embedding (which of 4 cameras each token is from)
+        cam_emb = self.camera_embed(self._patch_cam_ids)  # (1024, embed_dim)
+        image_emb = image_emb + cam_emb
 
-        # Cross-attention: text attends over image tokens
-        # key_padding_mask: True where PADDING (opposite of attention_mask)
-        key_padding_mask = None  # image tokens are all valid
-        fused, _ = self.cross_attn(
+        text_emb = self.text_proj(text_tokens_feat)  # (B, text_len, embed_dim)
+
+        # Cross-attention: text attends over ALL 1024 image tokens (full 360°)
+        fused, attn_weights = self.cross_attn(
             query=text_emb, key=image_emb, value=image_emb,
-            key_padding_mask=key_padding_mask,
-        )  # (B, text_len, embed_dim)
+            average_attn_weights=True,
+        )  # fused: (B, text_len, embed_dim), attn_weights: (B, text_len, 1024)
 
-        # Masked mean over valid text tokens
+        # Scene summary: mean-pool fused output over valid text tokens (semantic: WHAT)
         mask = text_mask_only.unsqueeze(-1).to(fused.dtype)  # (B, text_len, 1)
         scene_summary = (fused * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)  # (B, embed_dim)
 
-        # Concat with flight state → predict target
-        head_input = torch.cat([scene_summary, flight_state], dim=-1)
-        target_logits = self.target_mlp(head_input)                     # (B, 3) pre-tanh
-        target_body = torch.tanh(target_logits) * self.target_range     # (B, 3) bounded
-        self._last_target_logits = target_logits  # stash pre-tanh for aux loss (avoids tanh saturation)
-        return target_body
+        # Attention-weighted spatial coordinates (geometric: WHERE)
+        mask_2d = text_mask_only.to(attn_weights.dtype)
+        avg_attn = (attn_weights * mask_2d.unsqueeze(-1)).sum(dim=1) / mask_2d.sum(dim=1, keepdim=True).clamp(min=1)  # (B, 1024)
+
+        attn_row = (avg_attn * self._patch_rows).sum(dim=-1, keepdim=True)
+        attn_col = (avg_attn * self._patch_cols).sum(dim=-1, keepdim=True)
+        attn_depth = (avg_attn * patch_depths).sum(dim=-1, keepdim=True)
+        attn_spatial = torch.cat([attn_row, attn_col, attn_depth], dim=-1)  # (B, 3)
+
+        # Object classification logits
+        self._last_obj_logits = self.obj_classifier(scene_summary)
+
+        return scene_summary, attn_spatial
 
     def forward(self, obs: dict[str, torch.Tensor], masks=None, hidden_state=None, stochastic_output: bool = False) -> torch.Tensor:
-        # 1. PaliGemma token features (frozen, no grad) — use cached if available
-        if "vla_token_features" in obs and obs["vla_token_features"].abs().sum() > 0:
-            token_features = obs["vla_token_features"].float()  # fp16 → fp32
-        else:
-            rgb = obs["rgb"]
-            text_tokens = obs["text_tokens"].long()
-            text_mask = obs["text_mask"].long()
-            token_features = self.paligemma.get_token_features(rgb, text_tokens, text_mask)
+        # 1. PaliGemma token features for 4 camera views
+        rgb = obs["rgb"]  # (B, 4, 224, 224, 3)
+        text_tokens = obs["text_tokens"].long()  # (B, 280)
+        text_mask = obs["text_mask"].long()       # (B, 280)
+        B = rgb.shape[0]
+        n_img = self._num_image_tokens_per_cam  # 256
 
-        # 2. Attention-based target prediction
+        # Process each camera view through PaliGemma → collect image tokens
+        all_image_tokens = []
+        for cam_idx in range(self._num_cameras):
+            cam_rgb = rgb[:, cam_idx]  # (B, 224, 224, 3)
+            cam_tokens = self.paligemma.get_token_features(cam_rgb, text_tokens, text_mask)  # (B, 280, 2048)
+            cam_image_tokens = cam_tokens[:, :n_img]  # (B, 256, 2048) — image tokens only
+            all_image_tokens.append(cam_image_tokens)
+            self.paligemma.clear_cache()  # clear between views
+        all_image_tokens = torch.cat(all_image_tokens, dim=1)  # (B, 1024, 2048)
+
+        # Extract text token features from the last PaliGemma pass (text is the same for all views)
+        text_tokens_feat = cam_tokens[:, n_img:]  # (B, text_len, 2048)
+        text_mask_only = text_mask[:, n_img:]     # (B, text_len)
+
+        # 2. Pool depth maps to per-patch values — 4 cameras × 256 patches = 1024
         flight_state = obs["policy"]  # (B, 9)
-        text_mask = obs["text_mask"]  # (B, seq_len)
-        target_body = self._compute_target_from_tokens(token_features, text_mask, flight_state)
-        self._last_target_body = target_body  # stash for auxiliary supervision loss
+        depth = obs["depth"]  # (B, 4, 224, 224)
+        # Pool each view: (B, 4, 224, 224) → (B, 4, 16, 16) → (B, 1024)
+        depth_flat = depth.reshape(B * 4, 1, 224, 224)
+        patch_depths = self._depth_pool(depth_flat).reshape(B, -1)  # (B, 1024)
 
-        # (hold override removed — conflicted with zero-init head. Rely on
-        # PPO + attention to learn target offsets directly.)
+        # 3. Cross-attention over 1024 image tokens (full 360° view)
+        scene_summary, attn_spatial = self._compute_scene_summary(
+            all_image_tokens, text_tokens_feat, text_mask_only, patch_depths
+        )
 
-        # 3. Build 15-dim observation for waypoint policy
-        # Slots: [flight_state(9), target_pos_b(3), pos_error_w(3)]
-        # pos_error_w comes from env (world-frame error), matching waypoint training format
+        # Stash mean-pooled features for critic (avoids re-running PaliGemma)
+        self._critic_features = all_image_tokens.mean(dim=1).detach()  # (B, 2048)
+
+        # 4. LSTM temporal memory — accumulates spatial context across frames
+        lstm_input = torch.cat([scene_summary, attn_spatial, flight_state], dim=-1)  # (B, 268)
+        lstm_input = lstm_input.unsqueeze(1)  # (B, 1, 265) — single timestep, batch_first
+
+        if self._lstm_h is not None and self._lstm_h.shape[1] == lstm_input.shape[0]:
+            lstm_out, (self._lstm_h, self._lstm_c) = self.lstm(
+                lstm_input, (self._lstm_h.detach(), self._lstm_c.detach())
+            )
+        else:
+            # First step or batch size changed (PPO update) — no prior state
+            lstm_out, (self._lstm_h, self._lstm_c) = self.lstm(lstm_input)
+
+        memory_out = lstm_out.squeeze(1)  # (B, hidden)
+
+        # 5. Target prediction from temporal spatial memory
+        target_logits = self.target_mlp(memory_out)                     # (B, 3) pre-tanh
+        target_body = torch.tanh(target_logits) * self.target_range     # (B, 3) bounded
+        self._last_target_logits = target_logits
+        self._last_target_body = target_body
+
+        # 6. Build 15-dim observation for frozen waypoint policy
         pos_error_w = obs["pos_error_w"]  # (B, 3)
         wp_obs = torch.cat([flight_state, target_body.detach(), pos_error_w], dim=-1)  # (B, 15)
 
-        # 4. Run frozen waypoint policy
+        # 7. Run frozen waypoint policy
         action_mean = self._waypoint_policy_forward(wp_obs)
         self._action_mean = action_mean
         self._action_std = self._std_param.exp().expand_as(action_mean)
@@ -698,7 +813,15 @@ class HierarchicalVLAActor(nn.Module):
     def get_hidden_state(self):
         return None
 
-    def reset(self, env_ids=None):
+    def reset(self, dones=None):
+        # Reset LSTM hidden state for done environments
+        if dones is not None and self._lstm_h is not None:
+            done_mask = (dones == 1) if dones.dtype != torch.bool else dones
+            self._lstm_h[:, done_mask, :] = 0.0
+            self._lstm_c[:, done_mask, :] = 0.0
+        elif dones is None:
+            self._lstm_h = None
+            self._lstm_c = None
         self.paligemma.clear_cache()
 
 
@@ -706,12 +829,13 @@ class HierarchicalVLACritic(nn.Module):
     """Value head on PaliGemma features + flight state.
 
     The PaliGemma backbone is shared with the actor (set after construction).
-    Only this MLP is trainable.
+    Feedforward — no LSTM needed for value estimation (actor LSTM provides
+    the temporal context that matters for target prediction).
     """
 
     is_recurrent = False
 
-    def __init__(self, flight_state_dim: int = 9):
+    def __init__(self, flight_state_dim: int = 9, lstm_hidden_dim: int = 128):
         super().__init__()
         fused_dim = PaliGemmaFeatureExtractor.FEATURE_DIM + flight_state_dim
         self.mlp = nn.Sequential(
@@ -724,20 +848,19 @@ class HierarchicalVLACritic(nn.Module):
         self._shared_paligemma: PaliGemmaFeatureExtractor | None = None
 
     def forward(self, obs: dict[str, torch.Tensor], masks=None, hidden_state=None, stochastic_output: bool = False) -> torch.Tensor:
-        # Use token features (shared with actor via cache), then mean-pool for value estimation
-        if "vla_token_features" in obs and obs["vla_token_features"].abs().sum() > 0:
-            token_features = obs["vla_token_features"].float()  # (B, seq_len, 2048)
+        # Use cached scene features from actor (avoids re-running PaliGemma on 4 views)
+        # During rollout: actor runs first and stashes _cached_scene_features
+        # During PPO update: vla_token_features from rollout buffer are available
+        if hasattr(self, '_cached_scene_features') and self._cached_scene_features is not None:
+            vla_features = self._cached_scene_features
+        elif "vla_token_features" in obs and obs["vla_token_features"].abs().sum() > 0:
+            token_features = obs["vla_token_features"].float()
+            text_mask = obs["text_mask"]
+            mask = text_mask.unsqueeze(-1).to(token_features.dtype)
+            vla_features = (token_features * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
         else:
-            assert self._shared_paligemma is not None
-            rgb = obs["rgb"]
-            text_tokens = obs["text_tokens"].long()
-            text_mask = obs["text_mask"].long()
-            token_features = self._shared_paligemma.get_token_features(rgb, text_tokens, text_mask)
-
-        # Mean-pool over sequence for critic (simple scalar scene summary)
-        text_mask = obs["text_mask"]
-        mask = text_mask.unsqueeze(-1).to(token_features.dtype)
-        vla_features = (token_features * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
+            # Fallback: zero features (should not happen in normal flow)
+            vla_features = torch.zeros(obs["policy"].shape[0], PaliGemmaFeatureExtractor.FEATURE_DIM, device=obs["policy"].device)
 
         flight_state = obs["policy"]
         fused = torch.cat([vla_features, flight_state], dim=-1)
@@ -749,5 +872,5 @@ class HierarchicalVLACritic(nn.Module):
     def get_hidden_state(self):
         return None
 
-    def reset(self, env_ids=None):
+    def reset(self, dones=None):
         pass
