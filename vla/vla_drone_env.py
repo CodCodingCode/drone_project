@@ -431,7 +431,7 @@ class VLADroneEnv(DirectRLEnv):
             "rgb": self._cached_rgb,             # (N, 4, 224, 224, 3) float [0,1] — 4 views
             "text_tokens": self._text_tokens,    # (N, 280) long
             "text_mask": self._text_mask,        # (N, 280) long
-            "vla_token_features": torch.zeros(self.num_envs, self.cfg.max_text_length, 2048, dtype=torch.float16, device=self.device),  # placeholder, filled by train loop
+            "vla_token_features": torch.zeros(self.num_envs, 1048, 2048, dtype=torch.float16, device=self.device),  # placeholder (1024 image + 24 text tokens), filled by train loop
             "target_gt_body": target_gt_body,    # (N, 3) ground-truth target in body frame for aux supervision
             "pos_error_w": pos_error_w,          # (N, 3) world-frame position error for frozen waypoint policy
             "target_obj_idx": self._target_obj_idx.float(),  # (N,) object class — cast to long for CE loss

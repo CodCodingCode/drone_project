@@ -4,7 +4,7 @@ from isaaclab_rl.rsl_rl import RslRlPpoActorCriticCfg, RslRlOnPolicyRunnerCfg, R
 
 @configclass
 class VLADronePPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    num_steps_per_env = 8  # reduced for faster iterations with PaliGemma 3B
+    num_steps_per_env = 4  # reduced: 4-camera token cache (1048×2048 fp16) needs ~4.4GB in rollout buffer
     max_iterations = 5000
     save_interval = 100
     experiment_name = "vla_drone_direct"
@@ -26,7 +26,7 @@ class VLADronePPORunnerCfg(RslRlOnPolicyRunnerCfg):
     aux_loss_weight: float = 5.0       # initial/peak MSE weight (high because head is detached from PPO)
     aux_warmup_end: int = 500          # full weight until this iteration
     aux_decay_end: int = 2000          # linear decay to aux_min_weight
-    aux_min_weight: float = 0.1        # residual weight after decay (prevents drift)
+    aux_min_weight: float = 0.5        # residual weight after decay (regularizes RL gradient flow)
 
     # LSTM temporal memory
     lstm_hidden_dim: int = 128
@@ -44,7 +44,7 @@ class VLADronePPORunnerCfg(RslRlOnPolicyRunnerCfg):
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=0.005,
+        entropy_coef=0.01,
         num_learning_epochs=5,
         num_mini_batches=4,
         learning_rate=1.0e-5,

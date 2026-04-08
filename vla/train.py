@@ -124,7 +124,7 @@ def compute_aux_weight(iteration: int, cfg) -> float:
         return cfg.aux_min_weight
 
 
-def ppo_update_with_aux(ppo, policy, aux_weight: float, aux_optimizer=None) -> dict[str, float]:
+def ppo_update_with_aux(ppo, policy, aux_weight: float, aux_optimizer=None, aux_params=None) -> dict[str, float]:
     """PPO update with auxiliary target supervision loss on the cross-attention head."""
     mean_value_loss = 0.0
     mean_surrogate_loss = 0.0
@@ -138,6 +138,7 @@ def ppo_update_with_aux(ppo, policy, aux_weight: float, aux_optimizer=None) -> d
     mean_err_z = 0.0
     mean_gt_dist = 0.0  # how far away the GT target actually is
 
+    policy.actor._force_lstm_reset = True  # prevent stale LSTM state during PPO update
     generator = ppo.storage.mini_batch_generator(ppo.num_mini_batches, ppo.num_learning_epochs)
 
     for (
@@ -174,7 +175,7 @@ def ppo_update_with_aux(ppo, policy, aux_weight: float, aux_optimizer=None) -> d
                 )
                 kl_mean = kl.mean()
                 if kl_mean > ppo.desired_kl * 2.0:
-                    ppo.learning_rate = max(1e-5, ppo.learning_rate / 1.5)
+                    ppo.learning_rate = max(5e-6, ppo.learning_rate / 1.5)
                 elif kl_mean < ppo.desired_kl / 2.0 and kl_mean > 0.0:
                     ppo.learning_rate = min(1e-2, ppo.learning_rate * 1.5)
                 for pg in ppo.optimizer.param_groups:
@@ -227,11 +228,15 @@ def ppo_update_with_aux(ppo, policy, aux_weight: float, aux_optimizer=None) -> d
         ppo.optimizer.zero_grad()
         if aux_optimizer is not None:
             aux_optimizer.zero_grad()
-            ppo_loss.backward()
+            ppo_loss.backward(retain_graph=True)
             nn.utils.clip_grad_norm_(policy.parameters(), ppo.max_grad_norm)
             ppo.optimizer.step()
             # Aux step: position MSE + object classification CE
+            # NOTE: PPO grads are still on aux_params (not zeroed), so
+            # aux_optimizer steps combined RL + aux gradients.
             (aux_weight * combined_aux_loss).backward()
+            if aux_params is not None:
+                nn.utils.clip_grad_norm_(aux_params, ppo.max_grad_norm)
             aux_optimizer.step()
         else:
             # Fallback: single optimizer (original behavior)
@@ -266,6 +271,7 @@ def ppo_update_with_aux(ppo, policy, aux_weight: float, aux_optimizer=None) -> d
 
     num_updates = ppo.num_learning_epochs * ppo.num_mini_batches
     ppo.storage.clear()
+    policy.actor._force_lstm_reset = False  # restore LSTM temporal tracking for rollout
 
     return {
         "value_function": mean_value_loss / num_updates,
@@ -359,6 +365,15 @@ def main():
     print(f"[INFO] PPO optimizer: {sum(p.numel() for p in ppo_params):,} params (critic + std)")
     print(f"[INFO] Aux optimizer: {sum(p.numel() for p in aux_params):,} params (cross-attention head) @ lr=3e-4")
 
+    # LoRA optimizer: PaliGemma LoRA adapters at very low LR
+    lora_params = [p for n, p in policy.named_parameters() if "lora_" in n and p.requires_grad]
+    lora_optimizer = None
+    if lora_params:
+        lora_optimizer = torch.optim.Adam(lora_params, lr=agent_cfg.lora_learning_rate)
+        print(f"[INFO] LoRA optimizer: {sum(p.numel() for p in lora_params):,} params @ lr={agent_cfg.lora_learning_rate}")
+    else:
+        print("[WARN] No LoRA params found — LoRA training disabled")
+
     # Resume from checkpoint if provided
     if args_cli.resume_path:
         print(f"[INFO] Resuming from checkpoint: {args_cli.resume_path}")
@@ -416,11 +431,16 @@ def main():
         with torch.no_grad():  # no_grad (not inference_mode) for LSTM hidden state compatibility
             for _ in range(num_steps_per_env):
                 actions = ppo.act(obs)
-                # Stash PaliGemma token features (fp16) so PPO replay skips the 3B model
-                cached = policy.actor.paligemma._cache_val
-                if cached is not None:
-                    ppo.transition.observations["vla_token_features"] = cached.detach().half()
-                policy.actor.paligemma.clear_cache()
+                # Stash concatenated image+text token features (fp16) so PPO replay skips PaliGemma
+                if hasattr(policy.actor, '_cached_all_tokens') and policy.actor._cached_all_tokens is not None:
+                    cached = policy.actor._cached_all_tokens  # (B, 1024+text_len, 2048)
+                    # Pad or truncate to match placeholder size (1048 tokens)
+                    T = ppo.transition.observations["vla_token_features"].shape[1]
+                    if cached.shape[1] < T:
+                        pad = torch.zeros(cached.shape[0], T - cached.shape[1], cached.shape[2], device=cached.device, dtype=cached.dtype)
+                        cached = torch.cat([cached, pad], dim=1)
+                    ppo.transition.observations["vla_token_features"] = cached[:, :T].half()
+                    policy.actor._cached_all_tokens = None  # free memory
 
                 obs, rewards, dones, extras = env.step(actions.to(env.device))
                 obs, rewards, dones = obs.to(device), rewards.to(device), dones.to(device)
@@ -439,7 +459,29 @@ def main():
         obs = obs.clone()
         ppo.compute_returns(obs)
         aux_weight = compute_aux_weight(it, agent_cfg)
-        loss_dict = ppo_update_with_aux(ppo, policy, aux_weight, aux_optimizer)
+        loss_dict = ppo_update_with_aux(ppo, policy, aux_weight, aux_optimizer, aux_params=aux_params)
+
+        # -- LoRA fine-tuning step (small mini-batch, full grad through PaliGemma) --
+        if lora_optimizer is not None and it >= agent_cfg.lora_warmup_iterations:
+            lora_optimizer.zero_grad()
+            lora_bs = min(agent_cfg.lora_mini_batch_size, env.num_envs)
+            idx = torch.randperm(env.num_envs, device=device)[:lora_bs]
+            lora_obs = {k: v[idx] if isinstance(v, torch.Tensor) else v for k, v in obs.items()}
+            # Zero out cached tokens to force fresh PaliGemma forward with grad
+            if "vla_token_features" in lora_obs:
+                lora_obs["vla_token_features"] = torch.zeros_like(lora_obs["vla_token_features"])
+
+            target_logits, obj_logits = policy.actor.forward_lora_grad(lora_obs)
+            gt_target = lora_obs["target_gt_body"]
+            gt_normalized = (gt_target / policy.actor.target_range).clamp(-0.999, 0.999)
+            gt_logits = torch.atanh(gt_normalized)
+            lora_loss = F.mse_loss(target_logits, gt_logits)
+            obj_target = lora_obs["target_obj_idx"].long()
+            lora_loss = lora_loss + F.cross_entropy(obj_logits, obj_target)
+
+            lora_loss.backward()
+            nn.utils.clip_grad_norm_(lora_params, agent_cfg.lora_max_grad_norm)
+            lora_optimizer.step()
 
         stop = time.time()
 
