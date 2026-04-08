@@ -856,6 +856,7 @@ class HierarchicalVLAActor(nn.Module):
         target_body = torch.tanh(target_logits) * self.target_range     # (B, 3) bounded
         self._last_target_logits = target_logits
         self._last_target_body = target_body
+        self._last_attn_spatial = attn_spatial.detach()  # diagnostic: raw geometric readout
 
         # 6. Build 15-dim observation for frozen waypoint policy
         pos_error_w = obs["pos_error_w"]  # (B, 3)

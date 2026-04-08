@@ -137,6 +137,7 @@ def ppo_update_with_aux(ppo, policy, aux_weight: float, aux_optimizer=None, aux_
     mean_err_y = 0.0
     mean_err_z = 0.0
     mean_gt_dist = 0.0  # how far away the GT target actually is
+    mean_attn_spatial_err = 0.0  # raw geometric readout error (before LSTM/MLP)
 
     policy.actor._force_lstm_reset = True  # prevent stale LSTM state during PPO update
     generator = ppo.storage.mini_batch_generator(ppo.num_mini_batches, ppo.num_learning_epochs)
@@ -251,6 +252,11 @@ def ppo_update_with_aux(ppo, policy, aux_weight: float, aux_optimizer=None, aux_
             err = predicted_target - gt_target                  # (B, 3)
             target_l2 = err.norm(dim=-1).mean()
             axis_err = err.abs().mean(dim=0)                    # (3,) mean absolute error per axis
+            # Diagnostic: how good is the raw geometric attention readout?
+            if hasattr(policy.actor, '_last_attn_spatial') and policy.actor._last_attn_spatial is not None:
+                attn_err = (policy.actor._last_attn_spatial - gt_target).norm(dim=-1).mean()
+            else:
+                attn_err = torch.tensor(0.0)
 
         # Classification accuracy
         with torch.no_grad():
@@ -268,6 +274,7 @@ def ppo_update_with_aux(ppo, policy, aux_weight: float, aux_optimizer=None, aux_
         mean_err_y += axis_err[1].item()
         mean_err_z += axis_err[2].item()
         mean_gt_dist += gt_target.norm(dim=-1).mean().item()
+        mean_attn_spatial_err += attn_err.item()
 
     num_updates = ppo.num_learning_epochs * ppo.num_mini_batches
     ppo.storage.clear()
@@ -285,6 +292,7 @@ def ppo_update_with_aux(ppo, policy, aux_weight: float, aux_optimizer=None, aux_
         "target_err_y": mean_err_y / num_updates,
         "target_err_z": mean_err_z / num_updates,
         "gt_target_dist_m": mean_gt_dist / num_updates,
+        "attn_spatial_err_m": mean_attn_spatial_err / num_updates,
     }
 
 
@@ -526,10 +534,12 @@ def main():
             ez = loss_dict.get('target_err_z', 0)
             gt_d = loss_dict.get('gt_target_dist_m', 0)
             cls_acc = loss_dict.get('cls_accuracy', 0)
+            attn_err = loss_dict.get('attn_spatial_err_m', 0)
             print(
                 f"[{it:5d}/{max_iterations}]  reward={mean_reward:7.2f}  "
                 f"ep_len={mean_ep_len:6.1f}  fps={fps:7.0f}  "
                 f"aux={loss_dict.get('aux_target_mse', 0):.4f}  tgt_err={loss_dict.get('target_l2_error_m', 0):.3f}m  "
+                f"attn_err={attn_err:.3f}m  "
                 f"cls_acc={cls_acc:.0%}  "
                 f"err_xyz=({ex:.2f},{ey:.2f},{ez:.2f})  gt_dist={gt_d:.2f}m  "
                 f"succ={succ_rate:.0%}  wrong={wrong_rate:.0%}  dist={final_dist:.2f}m"
