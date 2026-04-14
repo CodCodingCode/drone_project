@@ -578,8 +578,10 @@ class VLADroneEnv(DirectRLEnv):
         wrong_obj_pos = self._obj_pos_w[env_ids][wrong_mask].reshape(len(env_ids), 2, 3)
         dist_to_wrong = torch.linalg.norm(wrong_obj_pos - drone_pos.unsqueeze(1), dim=-1).min(dim=1).values
 
-        success_term = (dist < self.cfg.success_threshold).float().mean()
-        wrong_term = (dist_to_wrong < self.cfg.success_threshold).float().mean()
+        success_mask = dist < self.cfg.success_threshold
+        wrong_mask_arrival = dist_to_wrong < self.cfg.success_threshold
+        success_term = success_mask.float().mean()
+        wrong_term = wrong_mask_arrival.float().mean()
         fell_term = ((drone_pos[:, 2] < 0.1) | (drone_pos[:, 2] > 3.0)).float().mean()
         timeout_term = (self.episode_length_buf[env_ids] >= self.max_episode_length - 1).float().mean()
 
@@ -587,6 +589,42 @@ class VLADroneEnv(DirectRLEnv):
         extras["Termination/wrong_object_rate"] = wrong_term
         extras["Termination/fell_rate"] = fell_term
         extras["Termination/timeout_rate"] = timeout_term
+
+        # Per-object breakdown: success/wrong rate for each target type
+        # Plus a confusion matrix (which wrong object did the drone go to?)
+        target_idx = self._target_obj_idx[env_ids]  # (N,) — true target class
+        obj_names = ["cube", "sphere", "cylinder"]
+        for obj_class in range(3):
+            class_mask = (target_idx == obj_class)
+            n_class = class_mask.sum()
+            if n_class > 0:
+                cls_succ = success_mask[class_mask].float().mean()
+                cls_wrong = wrong_mask_arrival[class_mask].float().mean()
+                cls_dist = dist[class_mask].mean()
+                extras[f"PerObject/{obj_names[obj_class]}_success_rate"] = cls_succ
+                extras[f"PerObject/{obj_names[obj_class]}_wrong_rate"] = cls_wrong
+                extras[f"PerObject/{obj_names[obj_class]}_final_dist"] = cls_dist
+                extras[f"PerObject/{obj_names[obj_class]}_count"] = n_class.float()
+
+        # Confusion matrix: when the drone hits a wrong object, which one?
+        # For each target class, find the index of the closest wrong object the drone ended at
+        if wrong_mask_arrival.any():
+            # Compute distance from drone to ALL three objects
+            all_dists = torch.linalg.norm(
+                self._obj_pos_w[env_ids] - drone_pos.unsqueeze(1), dim=-1
+            )  # (N, 3)
+            closest_obj = all_dists.argmin(dim=-1)  # (N,) — which object the drone is closest to
+
+            for true_class in range(3):
+                for pred_class in range(3):
+                    if true_class == pred_class:
+                        continue
+                    # Episodes where target was true_class but drone ended at pred_class (wrongly)
+                    confusion_mask = (target_idx == true_class) & (closest_obj == pred_class) & wrong_mask_arrival
+                    n_target = (target_idx == true_class).sum()
+                    if n_target > 0:
+                        rate = confusion_mask.float().sum() / n_target.float()
+                        extras[f"Confusion/{obj_names[true_class]}_to_{obj_names[pred_class]}"] = rate
 
         # Distance diagnostics (at episode end)
         extras["Diagnostic/final_dist_to_target"] = dist.mean()

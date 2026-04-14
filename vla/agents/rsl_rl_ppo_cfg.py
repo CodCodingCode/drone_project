@@ -23,10 +23,12 @@ class VLADronePPORunnerCfg(RslRlOnPolicyRunnerCfg):
     )
 
     # Auxiliary target supervision (MSE on cross-attention head's predicted target vs ground truth)
-    aux_loss_weight: float = 5.0       # initial/peak MSE weight (high because head is detached from PPO)
-    aux_warmup_end: int = 500          # full weight until this iteration
-    aux_decay_end: int = 2000          # linear decay to aux_min_weight
-    aux_min_weight: float = 0.5        # residual weight after decay (regularizes RL gradient flow)
+    # Constant weight — never decay. RL has no precise spatial gradient, so the aux loss is the
+    # only thing teaching the spatial head. Decaying it caused regression after iter 500.
+    aux_loss_weight: float = 5.0
+    aux_warmup_end: int = 1000000      # effectively never end warmup (always full weight)
+    aux_decay_end: int = 1000000       # never decay
+    aux_min_weight: float = 5.0        # same as peak
 
     # LSTM temporal memory
     lstm_hidden_dim: int = 128

@@ -195,11 +195,12 @@ class PaliGemmaFeatureExtractor(nn.Module):
         pixel_values: torch.Tensor,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Return full token-level hidden states (not pooled).
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return Gemma last hidden state AND SigLIP vision features.
 
         Returns:
-            (B, seq_len, 2048) float32 tensor — full sequence, detached.
+            gemma_features: (B, seq_len, 2048) — full sequence after Gemma (text-rich)
+            siglip_features: (B, 256, 2048) — vision features before Gemma (spatially coherent)
         """
         with torch.amp.autocast("cuda", dtype=self._dtype):
             outputs = self.model.model(
@@ -209,14 +210,17 @@ class PaliGemmaFeatureExtractor(nn.Module):
                 output_hidden_states=False,
                 return_dict=True,
             )
-        return outputs.last_hidden_state.float()  # (B, seq_len, 2048)
+        # Undo PaliGemma's sqrt(hidden_size) normalization so SigLIP features
+        # are at the same scale as Gemma features (which image_proj expects)
+        siglip_features = outputs.image_hidden_states * (2048 ** 0.5)  # (B, 256, 2048)
+        return outputs.last_hidden_state.float(), siglip_features.float()
 
     def forward_tokens_with_grad(
         self,
         pixel_values: torch.Tensor,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Like forward_tokens but with LoRA gradients enabled (no @torch.no_grad).
 
         Use only on small mini-batches for LoRA fine-tuning.
@@ -229,12 +233,15 @@ class PaliGemmaFeatureExtractor(nn.Module):
                 output_hidden_states=False,
                 return_dict=True,
             )
-        return outputs.last_hidden_state.float()  # (B, seq_len, 2048)
+        siglip_features = outputs.image_hidden_states * (2048 ** 0.5)
+        return outputs.last_hidden_state.float(), siglip_features.float()
 
-    def get_token_features(self, rgb: torch.Tensor, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    def get_token_features(self, rgb: torch.Tensor, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Cached, mini-batched token-level feature extraction.
 
-        Returns token sequence (B, seq_len, 2048) for attention-based heads.
+        Returns:
+            gemma_features: (B, seq_len, 2048) — Gemma last hidden state (text-rich)
+            siglip_features: (B, 256, 2048) — SigLIP vision features (spatially coherent)
         """
         cache_key = ("tokens", rgb.data_ptr())
         if self._cache_key == cache_key and self._cache_val is not None:
@@ -243,21 +250,22 @@ class PaliGemmaFeatureExtractor(nn.Module):
         pixel_values = self.preprocess_images(rgb)
 
         batch_size = pixel_values.shape[0]
-        chunk_size = 32  # smaller chunks since we're keeping full sequence (more memory)
+        chunk_size = 32
         if batch_size <= chunk_size:
             features = self.forward_tokens(pixel_values, input_ids, attention_mask)
         else:
-            chunks = []
+            gemma_chunks, siglip_chunks = [], []
             for i in range(0, batch_size, chunk_size):
                 j = min(i + chunk_size, batch_size)
-                chunk_feat = self.forward_tokens(
+                gemma_c, siglip_c = self.forward_tokens(
                     pixel_values[i:j], input_ids[i:j], attention_mask[i:j]
                 )
-                chunks.append(chunk_feat)
-            features = torch.cat(chunks, dim=0)
+                gemma_chunks.append(gemma_c)
+                siglip_chunks.append(siglip_c)
+            features = (torch.cat(gemma_chunks, dim=0), torch.cat(siglip_chunks, dim=0))
 
         self._cache_key = cache_key
-        self._cache_val = features.detach()
+        self._cache_val = (features[0].detach(), features[1].detach())
         return self._cache_val
 
     def forward_with_grad(
@@ -793,27 +801,27 @@ class HierarchicalVLAActor(nn.Module):
 
         # Check for cached token features from rollout buffer (skips PaliGemma during PPO update)
         if "vla_token_features" in obs and obs["vla_token_features"].abs().sum() > 0:
-            cached = obs["vla_token_features"].float()  # (B, 1024, 2048) fp16→fp32
-            all_image_tokens = cached[:, :self._num_image_tokens_total]  # (B, 1024, 2048)
-            text_tokens_feat = cached[:, self._num_image_tokens_total:]  # (B, text_len, 2048)
+            cached = obs["vla_token_features"].float()  # (B, 1048, 2048) fp16→fp32
+            # First 1024 = SigLIP image features (spatially coherent), rest = Gemma text features
+            all_image_tokens = cached[:, :self._num_image_tokens_total]  # (B, 1024, 2048) SigLIP
+            text_tokens_feat = cached[:, self._num_image_tokens_total:]  # (B, text_len, 2048) Gemma
             text_mask_only = text_mask[:, n_img:]  # (B, text_len)
         else:
-            # Process each camera view through PaliGemma → collect image tokens
+            # Process each camera view — use SigLIP features for images (spatial), Gemma for text (semantic)
             all_image_tokens = []
             for cam_idx in range(self._num_cameras):
                 cam_rgb = rgb[:, cam_idx]  # (B, 224, 224, 3)
-                cam_tokens = self.paligemma.get_token_features(cam_rgb, text_tokens, text_mask)  # (B, 280, 2048)
-                cam_image_tokens = cam_tokens[:, :n_img]  # (B, 256, 2048) — image tokens only
-                all_image_tokens.append(cam_image_tokens)
-                self.paligemma.clear_cache()  # clear between views
-            all_image_tokens = torch.cat(all_image_tokens, dim=1)  # (B, 1024, 2048)
+                gemma_feats, siglip_feats = self.paligemma.get_token_features(cam_rgb, text_tokens, text_mask)
+                all_image_tokens.append(siglip_feats)  # (B, 256, 2048) SigLIP — spatially coherent
+                self.paligemma.clear_cache()
+            all_image_tokens = torch.cat(all_image_tokens, dim=1)  # (B, 1024, 2048) SigLIP
 
-            # Extract text token features from the last PaliGemma pass (text is the same for all views)
-            text_tokens_feat = cam_tokens[:, n_img:]  # (B, text_len, 2048)
-            text_mask_only = text_mask[:, n_img:]     # (B, text_len)
+            # Text tokens from Gemma last hidden state (semantically rich, last camera pass)
+            text_tokens_feat = gemma_feats[:, n_img:]  # (B, text_len, 2048) Gemma
+            text_mask_only = text_mask[:, n_img:]
 
-            # Cache concatenated features so train loop can store them in rollout buffer
-            self._cached_all_tokens = torch.cat([all_image_tokens, text_tokens_feat], dim=1).detach()  # (B, 1024+text_len, 2048)
+            # Cache: SigLIP image tokens + Gemma text tokens (same shape as before)
+            self._cached_all_tokens = torch.cat([all_image_tokens, text_tokens_feat], dim=1).detach()
 
         # 2. Pool depth maps to per-patch values — 4 cameras × 256 patches = 1024
         flight_state = obs["policy"]  # (B, 9)
@@ -847,12 +855,8 @@ class HierarchicalVLAActor(nn.Module):
 
         memory_out = lstm_out.squeeze(1)  # (B, hidden)
 
-        # 5. Target prediction: residual correction on top of geometric attention readout
-        # attn_spatial is already a decent 3D estimate from attention-weighted depth + camera rays.
-        # The MLP only needs to learn a small correction, not the full position from scratch.
-        attn_logits = torch.atanh((attn_spatial / self.target_range).clamp(-0.999, 0.999))  # (B, 3)
-        correction_logits = self.target_mlp(memory_out)                 # (B, 3) small correction
-        target_logits = attn_logits + correction_logits                 # (B, 3) pre-tanh
+        # 5. Target prediction from temporal spatial memory
+        target_logits = self.target_mlp(memory_out)                     # (B, 3) pre-tanh
         target_body = torch.tanh(target_logits) * self.target_range     # (B, 3) bounded
         self._last_target_logits = target_logits
         self._last_target_body = target_body
@@ -884,19 +888,20 @@ class HierarchicalVLAActor(nn.Module):
         n_img = self._num_image_tokens_per_cam
 
         # Run PaliGemma WITH grad (through LoRA) for each camera view
+        # Use SigLIP features for images (spatially coherent), Gemma for text
         all_image_tokens = []
         for cam_idx in range(self._num_cameras):
             cam_rgb = rgb[:, cam_idx]
             pixel_values = self.paligemma.preprocess_images(cam_rgb)
-            cam_tokens = self.paligemma.forward_tokens_with_grad(
+            gemma_feats, siglip_feats = self.paligemma.forward_tokens_with_grad(
                 pixel_values, text_tokens, text_mask
             )
-            all_image_tokens.append(cam_tokens[:, :n_img])
+            all_image_tokens.append(siglip_feats)  # SigLIP features (spatial)
             self.paligemma.clear_cache()
-        all_image_tokens = torch.cat(all_image_tokens, dim=1)  # (B, 1024, 2048)
+        all_image_tokens = torch.cat(all_image_tokens, dim=1)  # (B, 1024, 2048) SigLIP
 
-        # Text tokens from last camera pass
-        text_tokens_feat = cam_tokens[:, n_img:]
+        # Text tokens from Gemma (last camera pass)
+        text_tokens_feat = gemma_feats[:, n_img:]
         text_mask_only = text_mask[:, n_img:]
 
         depth = obs["depth"]
@@ -912,9 +917,7 @@ class HierarchicalVLAActor(nn.Module):
         lstm_out, _ = self.lstm(lstm_input)  # fresh LSTM, no hidden state
         memory_out = lstm_out.squeeze(1)
 
-        attn_logits = torch.atanh((attn_spatial / self.target_range).clamp(-0.999, 0.999))
-        correction_logits = self.target_mlp(memory_out)
-        target_logits = attn_logits + correction_logits
+        target_logits = self.target_mlp(memory_out)
         return target_logits, self._last_obj_logits
 
     @property

@@ -535,6 +535,18 @@ def main():
             gt_d = loss_dict.get('gt_target_dist_m', 0)
             cls_acc = loss_dict.get('cls_accuracy', 0)
             attn_err = loss_dict.get('attn_spatial_err_m', 0)
+
+            # Per-object success rates
+            def _g(key):
+                v = log.get(key, 0)
+                return v.item() if hasattr(v, "item") else v
+            cube_s = _g("PerObject/cube_success_rate")
+            sph_s = _g("PerObject/sphere_success_rate")
+            cyl_s = _g("PerObject/cylinder_success_rate")
+            cube_w = _g("PerObject/cube_wrong_rate")
+            sph_w = _g("PerObject/sphere_wrong_rate")
+            cyl_w = _g("PerObject/cylinder_wrong_rate")
+
             print(
                 f"[{it:5d}/{max_iterations}]  reward={mean_reward:7.2f}  "
                 f"ep_len={mean_ep_len:6.1f}  fps={fps:7.0f}  "
@@ -543,6 +555,10 @@ def main():
                 f"cls_acc={cls_acc:.0%}  "
                 f"err_xyz=({ex:.2f},{ey:.2f},{ez:.2f})  gt_dist={gt_d:.2f}m  "
                 f"succ={succ_rate:.0%}  wrong={wrong_rate:.0%}  dist={final_dist:.2f}m"
+            )
+            print(
+                f"          per-obj succ: cube={cube_s:.0%} sph={sph_s:.0%} cyl={cyl_s:.0%}  "
+                f"wrong: cube={cube_w:.0%} sph={sph_w:.0%} cyl={cyl_w:.0%}"
             )
 
         # -- Save --
