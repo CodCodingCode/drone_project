@@ -155,7 +155,7 @@ class VLADroneEnvCfg(DirectRLEnvCfg):
     proximity_scale = 8.0
     proximity_radius = 1.5
     success_reward = 25.0
-    hover_at_target_reward = 30.0  # base reward when conditions met; scales with dwell time
+    hover_at_target_reward = 50.0  # base reward when conditions met; scales with dwell time
     hover_at_target_radius = 0.5   # moderate radius — small enough to be "at target"
     hover_max_speed = 1.0          # relaxed — waypoint policy doesn't naturally brake hard
     hover_dwell_bonus = 3.0        # big bonus for sustained hovering (up to 4x base at dwell cap)

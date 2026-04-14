@@ -457,7 +457,7 @@ def main():
         paligemma_model_name="google/paligemma-3b-pt-224",
         init_std=0.3,
         target_range=3.0,
-        lstm_hidden_dim=128,
+        lstm_hidden_dim=256,
     ).to(device)
 
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -465,8 +465,18 @@ def main():
     actor_state = {k.removeprefix("actor."): v for k, v in state_dict.items() if k.startswith("actor.")}
     if not actor_state:
         actor_state = state_dict
-    missing, unexpected = actor.load_state_dict(actor_state, strict=False)
-    print(f"[INFO] Loaded actor: {len(missing)} missing, {len(unexpected)} unexpected keys")
+    tgt_sd = actor.state_dict()
+    skipped_shape = []
+    filtered = {}
+    for k, v in actor_state.items():
+        if k in tgt_sd and tgt_sd[k].shape != v.shape:
+            skipped_shape.append((k, tuple(v.shape), tuple(tgt_sd[k].shape)))
+            continue
+        filtered[k] = v
+    missing, unexpected = actor.load_state_dict(filtered, strict=False)
+    print(f"[INFO] Loaded actor: {len(missing)} missing, {len(unexpected)} unexpected, {len(skipped_shape)} shape-mismatched keys")
+    for k, src_shape, tgt_shape in skipped_shape:
+        print(f"   skip (shape) {k}: ckpt {src_shape} vs model {tgt_shape}")
     actor.eval()
 
     obs = env.get_observations()

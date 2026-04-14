@@ -536,6 +536,41 @@ class VLACriticModel(nn.Module):
 # Hierarchical VLA Actor — PaliGemma → Waypoint Head → Frozen Waypoint Policy
 # ---------------------------------------------------------------------------
 
+class DepthSpatialEncoder(nn.Module):
+    """Small CNN that encodes 4-camera depth into a compact spatial token.
+
+    Input:  depth (B, 4, 224, 224) normalized to [0, 1] (= meters / 20)
+    Output: spatial_feat (B, out_dim)
+
+    Weights are shared across the 4 cameras; per-camera features are flattened
+    and projected to `out_dim`. Gives the LSTM a dense metric geometry signal
+    beyond the single attention-weighted 3D point (`attn_spatial`).
+    """
+
+    def __init__(self, out_dim: int = 256):
+        super().__init__()
+        self.cnn = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=7, stride=4, padding=3),  # 224 -> 56
+            nn.ReLU(),
+            nn.Conv2d(16, 32, kernel_size=5, stride=4, padding=2), # 56 -> 14
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1), # 14 -> 7
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1),                               # (B*4, 64, 1, 1)
+        )
+        self.proj = nn.Sequential(
+            nn.Linear(64 * 4, out_dim),
+            nn.LayerNorm(out_dim),
+        )
+        self.out_dim = out_dim
+
+    def forward(self, depth: torch.Tensor) -> torch.Tensor:
+        B, C = depth.shape[0], depth.shape[1]
+        x = depth.reshape(B * C, 1, depth.shape[2], depth.shape[3])
+        x = self.cnn(x).reshape(B, C * 64)
+        return self.proj(x)
+
+
 class HierarchicalVLAActor(nn.Module):
     """Hierarchical VLA: PaliGemma → target waypoint → frozen waypoint nav policy.
 
@@ -565,11 +600,13 @@ class HierarchicalVLAActor(nn.Module):
         lora_alpha: float = 0.0,
         init_std: float = 0.3,
         target_range: float = 2.5,  # max |target_pos_b| output
-        lstm_hidden_dim: int = 128,
+        lstm_hidden_dim: int = 256,
+        depth_dropout_p: float = 0.1,
     ):
         super().__init__()
         self.target_range = target_range
         self._lstm_hidden_dim = lstm_hidden_dim
+        self._depth_dropout_p = depth_dropout_p
 
         # 1. PaliGemma feature extractor (frozen backbone with LoRA adapters)
         self.paligemma = PaliGemmaFeatureExtractor(
@@ -642,11 +679,22 @@ class HierarchicalVLAActor(nn.Module):
         # Depth pooling: 224x224 depth map → 16x16 → 256 per-patch depth values
         self._depth_pool = nn.AvgPool2d(kernel_size=14, stride=14)  # 224/14 = 16
 
+        # Depth spatial encoder: dense CNN features over all 4 depth maps.
+        # FALCON-style independent spatial pathway — does NOT flow through
+        # PaliGemma's cross-attention, so its accuracy is not bottlenecked by
+        # VLM attention patch-locality. Output dim matches embed_dim so we can
+        # fuse additively with scene_summary.
+        self.depth_encoder = DepthSpatialEncoder(out_dim=embed_dim)
+
         # LSTM temporal memory: accumulates spatial context across frames.
-        # Input: scene_summary(256) + attn_spatial(3: row,col,depth) + flight_state(9) = 268
-        # attn_spatial gives explicit WHERE from attention-weighted patch coordinates + depth.
+        # Input: fused(256) + obj_logits(3) + flight_state(9) = 268, where
+        #   fused       = scene_summary(WHAT, from VLM) + spatial_token(WHERE, from depth)
+        #   obj_logits  = raw classifier head output (which-of-3-objects) fed directly to
+        #                 target_mlp so action can exploit classifier's answer
+        # attn_spatial is still computed inside _compute_scene_summary and kept
+        # as a diagnostic, but no longer carries the main WHERE signal.
         self.lstm = nn.LSTM(
-            input_size=embed_dim + 3 + 9,  # scene_summary + attn_spatial + flight_state
+            input_size=embed_dim + 3 + 9,
             hidden_size=lstm_hidden_dim,
             num_layers=1,
             batch_first=True,
@@ -823,14 +871,20 @@ class HierarchicalVLAActor(nn.Module):
             # Cache: SigLIP image tokens + Gemma text tokens (same shape as before)
             self._cached_all_tokens = torch.cat([all_image_tokens, text_tokens_feat], dim=1).detach()
 
-        # 2. Pool depth maps to per-patch values — 4 cameras × 256 patches = 1024
+        # 2. Depth input with Bernoulli dropout (sensor-failure robustness during training)
         flight_state = obs["policy"]  # (B, 9)
         depth = obs["depth"]  # (B, 4, 224, 224)
+        if self.training and self._depth_dropout_p > 0.0:
+            keep = (torch.rand(B, 1, 1, 1, device=depth.device) > self._depth_dropout_p).to(depth.dtype)
+            depth_in = depth * keep
+        else:
+            depth_in = depth
+
         # Pool each view: (B, 4, 224, 224) → (B, 4, 16, 16) → (B, 1024)
-        depth_flat = depth.reshape(B * 4, 1, 224, 224)
+        depth_flat = depth_in.reshape(B * 4, 1, 224, 224)
         patch_depths = self._depth_pool(depth_flat).reshape(B, -1)  # (B, 1024)
 
-        # 3. Cross-attention over 1024 image tokens (full 360° view)
+        # 3. Cross-attention over 1024 image tokens (full 360° view) → scene_summary (WHAT)
         scene_summary, attn_spatial = self._compute_scene_summary(
             all_image_tokens, text_tokens_feat, text_mask_only, patch_depths
         )
@@ -838,9 +892,14 @@ class HierarchicalVLAActor(nn.Module):
         # Stash mean-pooled features for critic (avoids re-running PaliGemma)
         self._critic_features = all_image_tokens.mean(dim=1).detach()  # (B, 2048)
 
-        # 4. LSTM temporal memory — accumulates spatial context across frames
-        lstm_input = torch.cat([scene_summary, attn_spatial, flight_state], dim=-1)  # (B, 268)
-        lstm_input = lstm_input.unsqueeze(1)  # (B, 1, 265) — single timestep, batch_first
+        # 4. Independent spatial pathway from depth (WHERE) — FALCON-style
+        spatial_token = self.depth_encoder(depth_in)  # (B, embed_dim=256)
+
+        # 5. Additive fusion of WHAT + WHERE, plus direct object-identity logits
+        fused = scene_summary + spatial_token  # (B, 256)
+        obj_logits = self._last_obj_logits  # (B, 3) — set in _compute_scene_summary
+        lstm_input = torch.cat([fused, obj_logits, flight_state], dim=-1)  # (B, 268)
+        lstm_input = lstm_input.unsqueeze(1)  # (B, 1, 268) — single timestep, batch_first
 
         if self._force_lstm_reset:
             # PPO update: observations are shuffled, temporal state is meaningless
@@ -905,7 +964,12 @@ class HierarchicalVLAActor(nn.Module):
         text_mask_only = text_mask[:, n_img:]
 
         depth = obs["depth"]
-        depth_flat = depth.reshape(B * self._num_cameras, 1, 224, 224)
+        if self.training and self._depth_dropout_p > 0.0:
+            keep = (torch.rand(B, 1, 1, 1, device=depth.device) > self._depth_dropout_p).to(depth.dtype)
+            depth_in = depth * keep
+        else:
+            depth_in = depth
+        depth_flat = depth_in.reshape(B * self._num_cameras, 1, 224, 224)
         patch_depths = self._depth_pool(depth_flat).reshape(B, -1)
 
         scene_summary, attn_spatial = self._compute_scene_summary(
@@ -913,7 +977,10 @@ class HierarchicalVLAActor(nn.Module):
         )
 
         flight_state = obs["policy"]
-        lstm_input = torch.cat([scene_summary, attn_spatial, flight_state], dim=-1).unsqueeze(1)
+        spatial_token = self.depth_encoder(depth_in)
+        fused = scene_summary + spatial_token
+        obj_logits = self._last_obj_logits  # (B, 3)
+        lstm_input = torch.cat([fused, obj_logits, flight_state], dim=-1).unsqueeze(1)
         lstm_out, _ = self.lstm(lstm_input)  # fresh LSTM, no hidden state
         memory_out = lstm_out.squeeze(1)
 

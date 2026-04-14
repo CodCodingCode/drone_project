@@ -363,7 +363,7 @@ def main():
         if not p.requires_grad:
             continue
         # Cross-attention head params go to aux optimizer
-        if any(k in name for k in ["image_proj", "text_proj", "cross_attn", "target_mlp", "obj_classifier", "actor.lstm"]):
+        if any(k in name for k in ["image_proj", "text_proj", "cross_attn", "target_mlp", "obj_classifier", "actor.lstm", "depth_encoder"]):
             aux_params.append(p)
         else:
             ppo_params.append(p)
@@ -382,12 +382,26 @@ def main():
     else:
         print("[WARN] No LoRA params found — LoRA training disabled")
 
-    # Resume from checkpoint if provided
+    # Resume from checkpoint if provided. Tolerates architecture changes by
+    # dropping keys whose shapes no longer match (e.g. LSTM/target_mlp after
+    # the FALCON-style spatial-pathway refactor) so the compatible parts
+    # (PaliGemma LoRA, cross-attention, projections, aux heads) warm-start.
     if args_cli.resume_path:
         print(f"[INFO] Resuming from checkpoint: {args_cli.resume_path}")
         ckpt = torch.load(args_cli.resume_path, map_location=device, weights_only=False)
-        missing, unexpected = policy.load_state_dict(ckpt.get("model_state_dict", {}), strict=False)
-        print(f"  Loaded policy: {len(missing)} missing, {len(unexpected)} unexpected keys")
+        src_sd = ckpt.get("model_state_dict", {})
+        tgt_sd = policy.state_dict()
+        skipped_shape = []
+        filtered_sd = {}
+        for k, v in src_sd.items():
+            if k in tgt_sd and tgt_sd[k].shape != v.shape:
+                skipped_shape.append((k, tuple(v.shape), tuple(tgt_sd[k].shape)))
+                continue
+            filtered_sd[k] = v
+        missing, unexpected = policy.load_state_dict(filtered_sd, strict=False)
+        print(f"  Loaded policy: {len(missing)} missing, {len(unexpected)} unexpected, {len(skipped_shape)} shape-mismatched")
+        for k, src_shape, tgt_shape in skipped_shape:
+            print(f"    skip (shape) {k}: ckpt {src_shape} vs model {tgt_shape}")
         if "optimizer_state_dict" in ckpt:
             try:
                 ppo.optimizer.load_state_dict(ckpt["optimizer_state_dict"])

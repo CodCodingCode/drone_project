@@ -31,7 +31,7 @@ class VLADronePPORunnerCfg(RslRlOnPolicyRunnerCfg):
     aux_min_weight: float = 5.0        # same as peak
 
     # LSTM temporal memory
-    lstm_hidden_dim: int = 128
+    lstm_hidden_dim: int = 256
     lstm_num_layers: int = 1
     lstm_type: str = "lstm"
 
