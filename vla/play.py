@@ -8,6 +8,7 @@ Launch:
 
 import argparse
 import glob
+import math
 import os
 import sys
 import warnings
@@ -278,9 +279,17 @@ class OnboardCameraWrapper(gym.Wrapper):
                             font, 0.5, (200, 200, 200), 1)
 
         # --- Top-down minimap (PiP in bottom-left of observer view) ---
+        # World-fixed orientation: +X world → right, +Y world → up (top of image).
+        # Drone icon has a heading arrow showing where it's currently facing so the
+        # user can correlate observer view ("what's ahead of the drone") with map.
         if hasattr(unwrapped, "_robot") and hasattr(unwrapped, "_obj_pos_w"):
             pos = unwrapped._robot.data.root_pos_w[0].cpu().numpy()
             origin = unwrapped._terrain.env_origins[0].cpu().numpy()
+            quat = unwrapped._robot.data.root_quat_w[0].cpu().numpy()  # (w, x, y, z)
+            yaw = math.atan2(
+                2.0 * (quat[0] * quat[3] + quat[1] * quat[2]),
+                1.0 - 2.0 * (quat[2] * quat[2] + quat[3] * quat[3]),
+            )
 
             mm_size = 200
             minimap = np.zeros((mm_size, mm_size, 3), dtype=np.uint8)
@@ -310,13 +319,24 @@ class OnboardCameraWrapper(gym.Wrapper):
                     cv2.putText(minimap, "TGT", (ox - 12, oy - 18),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1, cv2.LINE_AA)
 
-            # Drone with yellow ring + label
+            # Drone with yellow ring + heading arrow + label
             dx, dy = world_to_mm(pos[0], pos[1])
             cv2.circle(minimap, (dx, dy), 6, (255, 255, 255), -1)
             cv2.circle(minimap, (dx, dy), 9, (0, 255, 255), 2)
+            # Heading arrow: 20px long, pointing in world direction of drone forward (+X body).
+            # In image coords, +X world = +x pixel, +Y world = -y pixel (image y is flipped).
+            arrow_len = 22
+            hx = int(dx + arrow_len * math.cos(yaw))
+            hy = int(dy - arrow_len * math.sin(yaw))
+            cv2.arrowedLine(minimap, (dx, dy), (hx, hy), (0, 255, 255), 2, tipLength=0.35)
             cv2.putText(minimap, "DRONE", (dx - 18, dy + 22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1, cv2.LINE_AA)
             cv2.rectangle(minimap, (0, 0), (mm_size - 1, mm_size - 1), (100, 100, 100), 1)
+            # Compass labels so the user knows orientation: +X world = RIGHT, +Y world = UP
+            cv2.putText(minimap, "+X", (mm_size - 22, mm_size // 2 + 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1, cv2.LINE_AA)
+            cv2.putText(minimap, "+Y", (mm_size // 2 - 10, 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1, cv2.LINE_AA)
 
             # Place minimap in bottom-left of observer view
             mm_y = main_h - mm_size - 10
@@ -336,6 +356,11 @@ class OnboardCameraWrapper(gym.Wrapper):
                 views = (rgb.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
                 labels = ["FRONT", "RIGHT", "BACK", "LEFT"]
                 for i, (view, label) in enumerate(zip(views, labels)):
+                    # Isaac TiledCamera outputs RGB; OpenCV expects BGR. Without
+                    # this swap, red cubes render blue and blue spheres render red
+                    # in the PiP — making it look like "find the red cube" points
+                    # at a blue object.
+                    view = cv2.cvtColor(view, cv2.COLOR_RGB2BGR)
                     resized = cv2.resize(view, (cam_cell, cam_cell))
                     row, col = divmod(i, 2)
                     y0 = self._BANNER_H + row * cam_cell
@@ -401,9 +426,18 @@ def main():
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.sim.device = args_cli.device if args_cli.device else "cuda:0"
 
-    # Render every physics step for smooth video
+    # Render every physics step for smooth video AND step the env once per
+    # physics tick so the onboard-camera PiP stays in sync. (Training uses
+    # decimation=2 for throughput, but in play the PiP was corrupted when we
+    # tried that.) The policy being called 2x more often is acceptable for
+    # playback visualization purposes.
     env_cfg.sim.render_interval = 1
     env_cfg.decimation = 1
+
+    # Capture 4-cam obs every step too, so the PiP grid stays in sync with the
+    # third-person observer view (default is 4 for training throughput; in play
+    # the 3-step lag made the PiP look like a different scenario).
+    env_cfg.camera_every_n = 1
 
     # Long episodes so we can watch full flights
     env_cfg.episode_length_s = 60.0
@@ -495,6 +529,24 @@ def main():
             if step % 100 == 0:
                 cmd = env_unwrapped._current_commands[0] if hasattr(env_unwrapped, '_current_commands') else "?"
                 print(f"  Step {step}/{total_steps} | Command: {cmd}")
+                # Diagnostic: compare cached _obj_pos_w to actual prim world poses.
+                # If they disagree, set_world_poses() isn't taking effect and the
+                # minimap is drawing from stale data.
+                try:
+                    cached = env_unwrapped._obj_pos_w[0].cpu().numpy()
+                    c_pos, _ = env_unwrapped._cube_view.get_world_poses()
+                    s_pos, _ = env_unwrapped._sphere_view.get_world_poses()
+                    y_pos, _ = env_unwrapped._cylinder_view.get_world_poses()
+                    actual = np.stack([c_pos[0].cpu().numpy(), s_pos[0].cpu().numpy(), y_pos[0].cpu().numpy()])
+                    drone = env_unwrapped._robot.data.root_pos_w[0].cpu().numpy()
+                    names = ["cube ", "sph  ", "cyl  "]
+                    print(f"    drone @ ({drone[0]:+.2f},{drone[1]:+.2f},{drone[2]:+.2f})")
+                    for i in range(3):
+                        diff = np.linalg.norm(cached[i] - actual[i])
+                        mark = " MISMATCH" if diff > 0.05 else ""
+                        print(f"    {names[i]} cached=({cached[i,0]:+.2f},{cached[i,1]:+.2f},{cached[i,2]:+.2f})  actual=({actual[i,0]:+.2f},{actual[i,1]:+.2f},{actual[i,2]:+.2f}) Δ={diff:.3f}m{mark}")
+                except Exception as e:
+                    print(f"    [diag] failed: {e}")
 
     env.close()
     # Find recorded video

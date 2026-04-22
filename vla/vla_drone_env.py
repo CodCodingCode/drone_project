@@ -688,10 +688,17 @@ class VLADroneEnv(DirectRLEnv):
         sphere_world = env_origins + obj_positions[1]
         cylinder_world = env_origins + obj_positions[2]
 
-        # Reposition the visual prims
-        self._cube_view.set_world_poses(positions=cube_world, indices=env_ids)
-        self._sphere_view.set_world_poses(positions=sphere_world, indices=env_ids)
-        self._cylinder_view.set_world_poses(positions=cylinder_world, indices=env_ids)
+        # Reposition the visual prims. We use set_local_poses (which writes to
+        # USD xformOps on the per-env parent) instead of set_world_poses, because
+        # set_world_poses writes to Fabric's worldMatrix and then calls
+        # fabric_hierarchy.update_world_xforms() which recomputes worldMatrix
+        # from the USD-authored localMatrix, silently discarding our write on
+        # every reset after the first. set_local_poses writes directly to the
+        # USD attribute the renderer actually reads.
+        env_ids_list = env_ids.tolist() if hasattr(env_ids, "tolist") else list(env_ids)
+        self._cube_view.set_local_poses(translations=obj_positions[0], indices=env_ids_list)
+        self._sphere_view.set_local_poses(translations=obj_positions[1], indices=env_ids_list)
+        self._cylinder_view.set_local_poses(translations=obj_positions[2], indices=env_ids_list)
 
         # Update cached positions for reward computation
         self._obj_pos_w[env_ids, 0] = cube_world
