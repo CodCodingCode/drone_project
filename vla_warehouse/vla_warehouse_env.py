@@ -46,7 +46,10 @@ from vla_warehouse.scene_setup import load_scene
 @configclass
 class VLAWarehouseDroneEnvCfg(_BaseVLADroneEnvCfg):
     # --------------------------- Scene selection ---------------------------
-    scene_name: str = "warehouse"   # key into pois.SCENES
+    # NOTE: "warehouse" (warehouse.usd) is typically just an empty floor/walls
+    # shell with no props. "warehouse_full" or "warehouse_shelves" are the
+    # populated variants with forklifts / racks / pallets.
+    scene_name: str = "warehouse_full"   # key into pois.SCENES
 
     # --------------------------- Episode ---------------------------
     episode_length_s = 30.0
@@ -79,6 +82,20 @@ class VLAWarehouseDroneEnvCfg(_BaseVLADroneEnvCfg):
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
         num_envs=128, env_spacing=40.0, replicate_physics=True,
     )
+
+    def __post_init__(self):
+        if hasattr(super(), "__post_init__"):
+            super().__post_init__()
+        # Widen camera clip range from parent's (0.01, 20) — warehouse walls
+        # on the far side are up to ~35m away.
+        wide_clip = sim_utils.PinholeCameraCfg(
+            focal_length=10.0,
+            focus_distance=100.0,
+            horizontal_aperture=20.0,
+            clipping_range=(0.05, 50.0),
+        )
+        for cam in (self.cam_front, self.cam_right, self.cam_back, self.cam_left):
+            cam.spawn = wide_clip
 
 
 class VLAWarehouseDroneEnv(_BaseVLADroneEnv):
@@ -202,6 +219,11 @@ class VLAWarehouseDroneEnv(_BaseVLADroneEnv):
     # Reset — pick POIs, place markers, build prompt, respawn drone
     # ---------------------------------------------------------------
     def _reset_idx(self, env_ids: torch.Tensor | None):
+        # `super().__init__` invokes this before our child-specific state
+        # (_active_poi_idx, _poi_local) exists. Skip and rely on the
+        # explicit _reset_idx call at the end of our __init__.
+        if not hasattr(self, "_active_poi_idx"):
+            return
         if env_ids is None or len(env_ids) == self.num_envs:
             env_ids = self._robot._ALL_INDICES
 

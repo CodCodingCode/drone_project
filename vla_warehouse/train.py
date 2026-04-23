@@ -66,17 +66,24 @@ gym.make = _patched_gym_make
 
 # ----- Phase 3: neutralize the AppLauncher inside vla.train ----------------
 # vla/train.py starts its own AppLauncher at module load. We already have
-# one running, so swap in a no-op that just returns our existing app.
+# one running, so swap __init__ for a no-op that returns our existing app.
+# BUT we MUST keep add_app_launcher_args functional — vla.train's parser
+# uses it to register --device, --headless, --enable_cameras, etc., which
+# main() reads via args_cli.device.
+import isaaclab.app
+
+_OriginalAppLauncher = isaaclab.app.AppLauncher
+
+
 class _NoopAppLauncher:
     def __init__(self, *_args, **_kwargs):
         self.app = _simulation_app
 
     @staticmethod
-    def add_app_launcher_args(_parser):
-        pass
+    def add_app_launcher_args(parser):
+        _OriginalAppLauncher.add_app_launcher_args(parser)
 
 
-import isaaclab.app
 isaaclab.app.AppLauncher = _NoopAppLauncher
 
 # ----- Phase 4: defer to vla.train -----------------------------------------

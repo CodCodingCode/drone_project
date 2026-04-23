@@ -58,20 +58,53 @@ def _patched_gym_make(task_id, **kwargs):
 gym.make = _patched_gym_make
 
 # ----- Phase 3: neutralize the AppLauncher inside vla.play -----------------
+# Replace __init__ with a no-op that returns our existing app, but preserve
+# add_app_launcher_args so the inner parser still gets --device etc.
+import isaaclab.app
+
+_OriginalAppLauncher = isaaclab.app.AppLauncher
+
+
 class _NoopAppLauncher:
     def __init__(self, *_args, **_kwargs):
         self.app = _simulation_app
 
     @staticmethod
-    def add_app_launcher_args(_parser):
-        pass
+    def add_app_launcher_args(parser):
+        _OriginalAppLauncher.add_app_launcher_args(parser)
 
 
-import isaaclab.app
 isaaclab.app.AppLauncher = _NoopAppLauncher
 
 # ----- Phase 4: defer to vla.play ------------------------------------------
 import vla.play  # noqa: F401
+
+# ----- Phase 5: patch VLADroneEnvWithObserver._setup_scene -----------------
+# vla/play.py defines VLADroneEnvWithObserver(VLADroneEnv) whose _setup_scene
+# REIMPLEMENTS parent logic from scratch (rather than calling super()). That
+# bypasses our warehouse scene loader entirely. We wrap it here so the
+# warehouse USD gets authored AFTER the observer camera's existing setup.
+from vla_warehouse.scene_setup import load_scene
+from vla_warehouse import pois as _pois
+
+_original_observer_setup = vla.play.VLADroneEnvWithObserver._setup_scene
+
+
+def _warehouse_aware_setup(self):
+    # Do the observer's original setup (markers, 5 cameras, terrain, lights)
+    _original_observer_setup(self)
+    # Then author the warehouse USD reference into each env.
+    scene_name = getattr(self.cfg, "scene_name", "warehouse_full")
+    scene_entry = _pois.get_scene(scene_name)
+    print(f"[vla_warehouse/play] loading scene '{scene_name}' into observer env")
+    load_scene(
+        scene_entry["usd_path"],
+        prim_regex="/World/envs/env_.*/Scene",
+        translation=(0.0, 0.0, 0.0),
+    )
+
+
+vla.play.VLADroneEnvWithObserver._setup_scene = _warehouse_aware_setup
 
 
 if __name__ == "__main__":

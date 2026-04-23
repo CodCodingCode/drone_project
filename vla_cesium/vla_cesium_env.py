@@ -230,6 +230,11 @@ class VLACesiumDroneEnv(_BaseVLADroneEnv):
     # Reset — pick POIs, place markers at real-world coords, build prompt
     # ---------------------------------------------------------------
     def _reset_idx(self, env_ids: torch.Tensor | None):
+        # `super().__init__` invokes this before our child-specific state
+        # (_active_poi_idx, _poi_enu) exists. Skip and rely on the
+        # explicit _reset_idx call at the end of our __init__.
+        if not hasattr(self, "_active_poi_idx"):
+            return
         if env_ids is None or len(env_ids) == self.num_envs:
             env_ids = self._robot._ALL_INDICES
 
